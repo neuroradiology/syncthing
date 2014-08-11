@@ -307,15 +307,20 @@ func (m *Model) NeedSize(repo string) (files int, bytes int64) {
 	return
 }
 
-// NeedFiles returns the list of currently needed files
+// NeedFiles returns the list of currently needed files, up to indexBatchSize
 func (m *Model) NeedFilesRepo(repo string) []protocol.FileInfo {
+	return m.NeedFilesRepoN(repo, indexBatchSize)
+}
+
+// NeedFiles returns the list of currently needed files, up to n
+func (m *Model) NeedFilesRepoN(repo string, n int) []protocol.FileInfo {
 	m.rmut.RLock()
 	defer m.rmut.RUnlock()
 	if rf, ok := m.repoFiles[repo]; ok {
-		fs := make([]protocol.FileInfo, 0, indexBatchSize)
+		fs := make([]protocol.FileInfo, 0, n)
 		rf.WithNeed(protocol.LocalNodeID, func(f protocol.FileIntf) bool {
 			fs = append(fs, f.(protocol.FileInfo))
-			return len(fs) < indexBatchSize
+			return len(fs) < n
 		})
 		return fs
 	}
