@@ -1,6 +1,8 @@
-// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
-// All rights reserved. Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -9,27 +11,32 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"syscall"
 	"time"
 )
 
 func init() {
 	if innerProcess && os.Getenv("STHEAPPROFILE") != "" {
+		rate := 1
+		if i, err := strconv.Atoi(os.Getenv("STHEAPPROFILE")); err == nil {
+			rate = i
+		}
 		l.Debugln("Starting heap profiling")
-		go saveHeapProfiles()
+		go saveHeapProfiles(rate)
 	}
 }
 
-func saveHeapProfiles() {
-	runtime.MemProfileRate = 1
+func saveHeapProfiles(rate int) {
+	runtime.MemProfileRate = rate
 	var memstats, prevMemstats runtime.MemStats
 
-	t0 := time.Now()
-	for t := range time.NewTicker(250 * time.Millisecond).C {
-		startms := int(t.Sub(t0).Seconds() * 1000)
+	name := fmt.Sprintf("heap-%05d.pprof", syscall.Getpid())
+	for {
 		runtime.ReadMemStats(&memstats)
+
 		if memstats.HeapInuse > prevMemstats.HeapInuse {
-			fd, err := os.Create(fmt.Sprintf("heap-%05d-%07d.pprof", syscall.Getpid(), startms))
+			fd, err := os.Create(name + ".tmp")
 			if err != nil {
 				panic(err)
 			}
@@ -41,7 +48,16 @@ func saveHeapProfiles() {
 			if err != nil {
 				panic(err)
 			}
+
+			_ = os.Remove(name) // Error deliberately ignored
+			err = os.Rename(name+".tmp", name)
+			if err != nil {
+				panic(err)
+			}
+
 			prevMemstats = memstats
 		}
+
+		time.Sleep(250 * time.Millisecond)
 	}
 }

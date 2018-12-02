@@ -1,6 +1,8 @@
-// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
-// All rights reserved. Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -11,7 +13,7 @@ import (
 	"strings"
 )
 
-func memorySize() (uint64, error) {
+func memorySize() (int64, error) {
 	cmd := exec.Command("sysctl", "hw.memsize")
 	out, err := cmd.Output()
 	if err != nil {
@@ -21,7 +23,7 @@ func memorySize() (uint64, error) {
 	if len(fs) != 2 {
 		return 0, errors.New("sysctl parse error")
 	}
-	bytes, err := strconv.ParseUint(fs[1], 10, 64)
+	bytes, err := strconv.ParseInt(fs[1], 10, 64)
 	if err != nil {
 		return 0, err
 	}

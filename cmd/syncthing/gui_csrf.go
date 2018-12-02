@@ -1,44 +1,64 @@
-// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
-// All rights reserved. Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
 import (
 	"bufio"
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/syncthing/syncthing/osutil"
+	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/sync"
 )
 
+// csrfTokens is a list of valid tokens. It is sorted so that the most
+// recently used token is first in the list. New tokens are added to the front
+// of the list (as it is the most recently used at that time). The list is
+// pruned to a maximum of maxCsrfTokens, throwing away the least recently used
+// tokens.
 var csrfTokens []string
-var csrfMut sync.Mutex
+var csrfMut = sync.NewMutex()
+
+const maxCsrfTokens = 25
 
 // Check for CSRF token on /rest/ URLs. If a correct one is not given, reject
 // the request with 403. For / and /index.html, set a new CSRF cookie if none
 // is currently set.
-func csrfMiddleware(prefix string, next http.Handler) http.Handler {
+func csrfMiddleware(unique string, prefix string, cfg config.GUIConfiguration, next http.Handler) http.Handler {
+	loadCsrfTokens()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Allow requests carrying a valid API key
-		if validAPIKey(r.Header.Get("X-API-Key")) {
+		if cfg.IsValidAPIKey(r.Header.Get("X-API-Key")) {
+			// Set the access-control-allow-origin header for CORS requests
+			// since a valid API key has been provided
+			w.Header().Add("Access-Control-Allow-Origin", "*")
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Allow requests for the front page, and set a CSRF cookie if there isn't already a valid one.
+		if strings.HasPrefix(r.URL.Path, "/rest/debug") {
+			// Debugging functions are only available when explicitly
+			// enabled, and can be accessed without a CSRF token
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Allow requests for anything not under the protected path prefix,
+		// and set a CSRF cookie if there isn't already a valid one.
 		if !strings.HasPrefix(r.URL.Path, prefix) {
-			cookie, err := r.Cookie("CSRF-Token")
+			cookie, err := r.Cookie("CSRF-Token-" + unique)
 			if err != nil || !validCsrfToken(cookie.Value) {
+				httpl.Debugln("new CSRF cookie in response to request for", r.URL)
 				cookie = &http.Cookie{
-					Name:  "CSRF-Token",
+					Name:  "CSRF-Token-" + unique,
 					Value: newCsrfToken(),
 				}
 				http.SetCookie(w, cookie)
@@ -47,14 +67,8 @@ func csrfMiddleware(prefix string, next http.Handler) http.Handler {
 			return
 		}
 
-		if r.Method == "GET" {
-			// Allow GET requests unconditionally
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		// Verify the CSRF token
-		token := r.Header.Get("X-CSRF-Token")
+		token := r.Header.Get("X-CSRF-Token-" + unique)
 		if !validCsrfToken(token) {
 			http.Error(w, "CSRF Error", 403)
 			return
@@ -67,8 +81,15 @@ func csrfMiddleware(prefix string, next http.Handler) http.Handler {
 func validCsrfToken(token string) bool {
 	csrfMut.Lock()
 	defer csrfMut.Unlock()
-	for _, t := range csrfTokens {
+	for i, t := range csrfTokens {
 		if t == token {
+			if i > 0 {
+				// Move this token to the head of the list. Copy the tokens at
+				// the front one step to the right and then replace the token
+				// at the head.
+				copy(csrfTokens[1:], csrfTokens[:i+1])
+				csrfTokens[0] = token
+			}
 			return true
 		}
 	}
@@ -76,18 +97,12 @@ func validCsrfToken(token string) bool {
 }
 
 func newCsrfToken() string {
-	bs := make([]byte, 30)
-	_, err := rand.Reader.Read(bs)
-	if err != nil {
-		l.Fatalln(err)
-	}
-
-	token := base64.StdEncoding.EncodeToString(bs)
+	token := rand.String(32)
 
 	csrfMut.Lock()
-	csrfTokens = append(csrfTokens, token)
-	if len(csrfTokens) > 10 {
-		csrfTokens = csrfTokens[len(csrfTokens)-10:]
+	csrfTokens = append([]string{token}, csrfTokens...)
+	if len(csrfTokens) > maxCsrfTokens {
+		csrfTokens = csrfTokens[:maxCsrfTokens]
 	}
 	defer csrfMut.Unlock()
 
@@ -97,33 +112,24 @@ func newCsrfToken() string {
 }
 
 func saveCsrfTokens() {
-	name := filepath.Join(confDir, "csrftokens.txt")
-	tmp := fmt.Sprintf("%s.tmp.%d", name, time.Now().UnixNano())
+	// We're ignoring errors in here. It's not super critical and there's
+	// nothing relevant we can do about them anyway...
 
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	name := locations[locCsrfTokens]
+	f, err := osutil.CreateAtomic(name)
 	if err != nil {
 		return
 	}
-	defer os.Remove(tmp)
 
 	for _, t := range csrfTokens {
-		_, err := fmt.Fprintln(f, t)
-		if err != nil {
-			return
-		}
+		fmt.Fprintln(f, t)
 	}
 
-	err = f.Close()
-	if err != nil {
-		return
-	}
-
-	osutil.Rename(tmp, name)
+	f.Close()
 }
 
 func loadCsrfTokens() {
-	name := filepath.Join(confDir, "csrftokens.txt")
-	f, err := os.Open(name)
+	f, err := os.Open(locations[locCsrfTokens])
 	if err != nil {
 		return
 	}

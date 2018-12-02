@@ -12,7 +12,7 @@ least the following:
  - What operating system, operating system version and version of
    Syncthing you are running
 
- - The same for other connected nodes, where relevant
+ - The same for other connected devices, where relevant
 
  - Screenshot if the issue concerns something visible in the GUI
 
@@ -31,63 +31,33 @@ latest info on Transifex.
 
 ## Contributing Code
 
-Please do contribute! If you want to contribute but are unsure where to
-start, the [Contributions Needed
-topic](http://discourse.syncthing.net/t/49) lists areas in need of
-attention. In general, any open issues are fair game! Be prepared for a
-[certain amount of
-review](https://discourse.syncthing.net/t/733); it's all in the name of
-quality. :)
+Every contribution is welcome. If you want to contribute but are unsure
+where to start, any open issues are fair game! See the [Contribution
+Guidelines](https://docs.syncthing.net/dev/contributing.html) for the full
+story on committing code.
+
+## Contributing Documentation
+
+Updates to the [documentation site](https://docs.syncthing.net/) can be
+made as pull requests on the [documentation
+repository](https://github.com/syncthing/docs).
 
 ## Licensing
 
-All contributions are made under the same MIT License as the rest of the
-project, except documentation which is licensed under the Creative
-Commons Attribution 4.0 International License. You retain the copyright
-to code you have written.
+All contributions are made available under the same license as the already
+existing material being contributed to. For most of the project and unless
+otherwise stated this means MPLv2, but there are exceptions:
 
-When accepting your first contribution, the maintainer of the project
-will ensure that you are added to the CONTRIBUTORS file. You are welcome
-to add yourself as a separate commit in your first pull request.
+- Certain commands (under cmd/...) may have a separate license, indicated by
+  the presence of a LICENSE file in the corresponding directory.
 
-## Building
+- The documentation (man/...) is licensed under the Creative Commons
+  Attribution 4.0 International License.
 
-[See the documentation](http://discourse.syncthing.net/t/44) on how to
-get started with a build environment.
+- Projects under vendor/... are copyright by and licensed from their
+  respective original authors. Contributions should be made to the original
+  project, not here.
 
-## Branches
+Regardless of the license in effect, you retain the copyright to your
+contribution.
 
- - `master` is the main branch containing good code that will end up in
-   the next release. You should base your work on it. It won't ever be
-   rebased or force-pushed to.
-
- - `vx.y` branches exist to make patch releases on otherwise obsolete
-   minor releases. Should only contain fixes cherry picked from master.
-   Don't base any work on them.
-
- - Other branches are probably topic branches and may be subject to
-   rebasing. Don't base any work on them unless you specifically know
-   otherwise.
-
-## Tags
-
-All releases are tagged semver style as `vx.y.z`. Release tags are
-signed by GPG key BCE524C7.
-
-## Tests
-
-Yes please!
-
-## Style
-
- - `go fmt`
-
- - Unix line breaks
-
-## Documentation
-
-[Over here!](http://discourse.syncthing.net/category/documentation)
-
-## License
-
-MIT

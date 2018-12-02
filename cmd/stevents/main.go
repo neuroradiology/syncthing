@@ -1,6 +1,8 @@
-// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
-// All rights reserved. Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -25,7 +27,7 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
 
-	target := flag.String("target", "localhost:8080", "Target Syncthing instance")
+	target := flag.String("target", "localhost:8384", "Target Syncthing instance")
 	apikey := flag.String("apikey", "", "Syncthing API key")
 	flag.Parse()
 
