@@ -16,13 +16,12 @@ var syncthing = angular.module('syncthing', [
 ]);
 
 var urlbase = 'rest';
+var authUrlbase = urlbase + '/noauth/auth';
+
+// keep consistent with ShortIDStringLength in lib/protocol/deviceid.go
+var shortIDStringLength = 7;
 
 syncthing.config(function ($httpProvider, $translateProvider, LocaleServiceProvider) {
-    var deviceIDShort = metadata.deviceID.substr(0, 5);
-    $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token-' + deviceIDShort;
-    $httpProvider.defaults.xsrfCookieName = 'CSRF-Token-' + deviceIDShort;
-    $httpProvider.useApplyAsync(true);
-
     // language and localisation
 
     $translateProvider.useSanitizeValueStrategy('escape');
@@ -30,9 +29,21 @@ syncthing.config(function ($httpProvider, $translateProvider, LocaleServiceProvi
         prefix: 'assets/lang/lang-',
         suffix: '.json'
     });
+    $translateProvider.fallbackLanguage('en');
 
     LocaleServiceProvider.setAvailableLocales(validLangs);
     LocaleServiceProvider.setDefaultLocale('en');
+
+    $httpProvider.useApplyAsync(true);
+
+    if (!window.metadata) {
+        // Most likely we're not authenticated yet, in which case we can't proceed with the rest of the setup.
+        // Do nothing and wait for the page reload on successful login.
+        return;
+    }
+
+    $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token-' + metadata.deviceIDShort;
+    $httpProvider.defaults.xsrfCookieName = 'CSRF-Token-' + metadata.deviceIDShort;
 });
 
 // @TODO: extract global level functions into separate service(s)
@@ -64,6 +75,23 @@ function folderCompare(a, b) {
         return -1;
     }
     return labelA > labelB;
+}
+
+function deviceMap(l) {
+    var m = {};
+    l.forEach(function (r) {
+        m[r.deviceID] = r;
+    });
+    return m;
+}
+
+function deviceList(m) {
+    var l = [];
+    for (var id in m) {
+        l.push(m[id]);
+    }
+    l.sort(deviceCompare);
+    return l;
 }
 
 function folderMap(l) {
@@ -156,7 +184,7 @@ function buildTree(children) {
         children: []
     }
 
-    $.each(children, function(path, data) {
+    $.each(children, function (path, data) {
         var parts = path.split('/');
         var name = parts.splice(-1)[0];
 
@@ -167,7 +195,7 @@ function buildTree(children) {
             keySoFar.push(part);
             var found = false;
             for (var i = 0; i < parent.children.length; i++) {
-                if (parent.children[i].title == part) {
+                if (parent.children[i].title == part && parent.children[i].folder === true) {
                     parent = parent.children[i];
                     found = true;
                     break;
@@ -179,7 +207,7 @@ function buildTree(children) {
                     key: keySoFar.join('/'),
                     folder: true,
                     children: []
-                }
+                };
                 parent.children.push(child);
                 parent = child;
             }
@@ -198,7 +226,7 @@ function buildTree(children) {
 
 // unitPrefixed converts the input such that it returns a string representation
 // <1000 (<1024) with the metric unit prefix suffixed. I.e. when calling this with
-// binary == true, you need to suffix an additon 'i'.  The "biggest" prefix used
+// binary == true, you need to suffix an addition 'i'.  The "biggest" prefix used
 // is 'T', numbers > 1000T are just returned as such big numbers. If ever deemed
 // useful 'P' can be added easily.
 function unitPrefixed(input, binary) {
@@ -209,31 +237,31 @@ function unitPrefixed(input, binary) {
     var i = '';
     if (binary) {
         factor = 1024;
-        i = 'i'
+        i = 'i';
     }
     if (input > factor * factor * factor * factor * 1000) {
         // Don't show any decimals for more than 4 digits
         input /= factor * factor * factor * factor;
-        return input.toLocaleString(undefined, {maximumFractionDigits: 0}) + ' T' + i;
+        return input.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' T' + i;
     }
     // Show 3 significant digits (e.g. 123T or 2.54T)
     if (input > factor * factor * factor * factor) {
         input /= factor * factor * factor * factor;
-        return input.toLocaleString(undefined, {maximumSignificantDigits: 3}) + ' T' + i;
+        return input.toLocaleString(undefined, { maximumSignificantDigits: 3 }) + ' T' + i;
     }
     if (input > factor * factor * factor) {
         input /= factor * factor * factor;
         if (binary && input >= 1000) {
-            return input.toLocaleString(undefined, {maximumFractionDigits: 0}) + ' G' + i;
+            return input.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' G' + i;
         }
-        return input.toLocaleString(undefined, {maximumSignificantDigits: 3}) + ' G' + i;
+        return input.toLocaleString(undefined, { maximumSignificantDigits: 3 }) + ' G' + i;
     }
     if (input > factor * factor) {
         input /= factor * factor;
         if (binary && input >= 1000) {
-            return input.toLocaleString(undefined, {maximumFractionDigits: 0}) + ' M' + i;
+            return input.toLocaleString(undefined, { maximumFractionDigits: 0 }) + ' M' + i;
         }
-        return input.toLocaleString(undefined, {maximumSignificantDigits: 3}) + ' M' + i;
+        return input.toLocaleString(undefined, { maximumSignificantDigits: 3 }) + ' M' + i;
     }
     if (input > factor) {
         input /= factor;
@@ -242,9 +270,9 @@ function unitPrefixed(input, binary) {
             prefix = ' K';
         }
         if (binary && input >= 1000) {
-            return input.toLocaleString(undefined, {maximumFractionDigits: 0}) + prefix + i;
+            return input.toLocaleString(undefined, { maximumFractionDigits: 0 }) + prefix + i;
         }
-        return input.toLocaleString(undefined, {maximumSignificantDigits: 3}) + prefix + i;
+        return input.toLocaleString(undefined, { maximumSignificantDigits: 3 }) + prefix + i;
     }
     return Math.round(input).toLocaleString() + ' ';
 };

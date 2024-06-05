@@ -10,14 +10,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 func TestMain(m *testing.M) {
@@ -47,7 +48,7 @@ var (
 	}
 	defaultCfg = config.Wrap("", config.Configuration{
 		Folders: []config.FolderConfiguration{defaultFolderCfg},
-	})
+	}, protocol.LocalDeviceID, events.NoopLogger)
 )
 
 // Represents possibly multiple (different event types) expected paths from
@@ -65,49 +66,74 @@ func TestAggregate(t *testing.T) {
 
 	folderCfg := defaultFolderCfg.Copy()
 	folderCfg.ID = "Aggregate"
-	ctx, _ := context.WithCancel(context.Background())
-	a := newAggregator(folderCfg, ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := newAggregator(ctx, folderCfg)
 
 	// checks whether maxFilesPerDir events in one dir are kept as is
 	for i := 0; i < maxFilesPerDir; i++ {
-		a.newEvent(fs.Event{filepath.Join("parent", strconv.Itoa(i)), fs.NonRemove}, inProgress)
+		a.newEvent(fs.Event{
+			Name: filepath.Join("parent", strconv.Itoa(i)),
+			Type: fs.NonRemove,
+		}, inProgress)
 	}
 	if l := len(getEventPaths(a.root, ".", a)); l != maxFilesPerDir {
 		t.Errorf("Unexpected number of events stored, got %v, expected %v", l, maxFilesPerDir)
 	}
 
 	// checks whether maxFilesPerDir+1 events in one dir are aggregated to parent dir
-	a.newEvent(fs.Event{filepath.Join("parent", "new"), fs.NonRemove}, inProgress)
+	a.newEvent(fs.Event{
+		Name: filepath.Join("parent", "new"),
+		Type: fs.NonRemove,
+	}, inProgress)
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"parent"})
 
 	// checks that adding an event below "parent" does not change anything
-	a.newEvent(fs.Event{filepath.Join("parent", "extra"), fs.NonRemove}, inProgress)
+	a.newEvent(fs.Event{
+		Name: filepath.Join("parent", "extra"),
+		Type: fs.NonRemove,
+	}, inProgress)
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"parent"})
 
 	// again test aggregation in "parent" but with event in subdirs
-	a = newAggregator(folderCfg, ctx)
+	a = newAggregator(ctx, folderCfg)
 	for i := 0; i < maxFilesPerDir; i++ {
-		a.newEvent(fs.Event{filepath.Join("parent", strconv.Itoa(i)), fs.NonRemove}, inProgress)
+		a.newEvent(fs.Event{
+			Name: filepath.Join("parent", strconv.Itoa(i)),
+			Type: fs.NonRemove,
+		}, inProgress)
 	}
-	a.newEvent(fs.Event{filepath.Join("parent", "sub", "new"), fs.NonRemove}, inProgress)
+	a.newEvent(fs.Event{
+		Name: filepath.Join("parent", "sub", "new"),
+		Type: fs.NonRemove,
+	}, inProgress)
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"parent"})
 
 	// test aggregation in root
-	a = newAggregator(folderCfg, ctx)
+	a = newAggregator(ctx, folderCfg)
 	for i := 0; i < maxFiles; i++ {
-		a.newEvent(fs.Event{strconv.Itoa(i), fs.NonRemove}, inProgress)
+		a.newEvent(fs.Event{
+			Name: strconv.Itoa(i),
+			Type: fs.NonRemove,
+		}, inProgress)
 	}
 	if len(getEventPaths(a.root, ".", a)) != maxFiles {
 		t.Errorf("Unexpected number of events stored in root")
 	}
-	a.newEvent(fs.Event{filepath.Join("parent", "sub", "new"), fs.NonRemove}, inProgress)
+	a.newEvent(fs.Event{
+		Name: filepath.Join("parent", "sub", "new"),
+		Type: fs.NonRemove,
+	}, inProgress)
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"."})
 
 	// checks that adding an event when "." is already stored is a noop
-	a.newEvent(fs.Event{"anythingelse", fs.NonRemove}, inProgress)
+	a.newEvent(fs.Event{
+		Name: "anythingelse",
+		Type: fs.NonRemove,
+	}, inProgress)
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"."})
 
-	a = newAggregator(folderCfg, ctx)
+	a = newAggregator(ctx, folderCfg)
 	filesPerDir := maxFilesPerDir / 2
 	dirs := make([]string, maxFiles/filesPerDir+1)
 	for i := 0; i < maxFiles/filesPerDir+1; i++ {
@@ -115,7 +141,10 @@ func TestAggregate(t *testing.T) {
 	}
 	for _, dir := range dirs {
 		for i := 0; i < filesPerDir; i++ {
-			a.newEvent(fs.Event{filepath.Join(dir, strconv.Itoa(i)), fs.NonRemove}, inProgress)
+			a.newEvent(fs.Event{
+				Name: filepath.Join(dir, strconv.Itoa(i)),
+				Type: fs.NonRemove,
+			}, inProgress)
 		}
 	}
 	compareBatchToExpectedDirect(t, getEventPaths(a.root, ".", a), []string{"."})
@@ -123,14 +152,18 @@ func TestAggregate(t *testing.T) {
 
 // TestInProgress checks that ignoring files currently edited by Syncthing works
 func TestInProgress(t *testing.T) {
+	evLogger := events.NewLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	go evLogger.Serve(ctx)
+	defer cancel()
 	testCase := func(c chan<- fs.Event) {
-		events.Default.Log(events.ItemStarted, map[string]string{
+		evLogger.Log(events.ItemStarted, map[string]string{
 			"item": "inprogress",
 		})
 		sleepMs(100)
 		c <- fs.Event{Name: "inprogress", Type: fs.NonRemove}
 		sleepMs(1000)
-		events.Default.Log(events.ItemFinished, map[string]interface{}{
+		evLogger.Log(events.ItemFinished, map[string]interface{}{
 			"item": "inprogress",
 		})
 		sleepMs(100)
@@ -142,7 +175,7 @@ func TestInProgress(t *testing.T) {
 		{[][]string{{"notinprogress"}}, 2000, 3500},
 	}
 
-	testScenario(t, "InProgress", testCase, expectedBatches)
+	testScenario(t, "InProgress", testCase, expectedBatches, evLogger)
 }
 
 // TestDelay checks that recurring changes to the same path are delayed
@@ -180,7 +213,7 @@ func TestDelay(t *testing.T) {
 		{[][]string{{delayed}, {delAfter}}, 3600, 7000},
 	}
 
-	testScenario(t, "Delay", testCase, expectedBatches)
+	testScenario(t, "Delay", testCase, expectedBatches, nil)
 }
 
 // TestNoDelay checks that no delay occurs if there are no non-remove events
@@ -197,15 +230,13 @@ func TestNoDelay(t *testing.T) {
 		{[][]string{{mixed}, {del}}, 500, 2000},
 	}
 
-	testScenario(t, "NoDelay", testCase, expectedBatches)
+	testScenario(t, "NoDelay", testCase, expectedBatches, nil)
 }
 
 func getEventPaths(dir *eventDir, dirPath string, a *aggregator) []string {
 	var paths []string
 	for childName, childDir := range dir.dirs {
-		for _, path := range getEventPaths(childDir, filepath.Join(dirPath, childName), a) {
-			paths = append(paths, path)
-		}
+		paths = append(paths, getEventPaths(childDir, filepath.Join(dirPath, childName), a)...)
 	}
 	for name := range dir.events {
 		paths = append(paths, filepath.Join(dirPath, name))
@@ -236,9 +267,7 @@ func compareBatchToExpected(batch []string, expectedPaths []string) (missing []s
 			missing = append(missing, expected)
 		}
 	}
-	for _, received := range batch {
-		unexpected = append(unexpected, received)
-	}
+	unexpected = append(unexpected, batch...)
 	return missing, unexpected
 }
 
@@ -253,19 +282,24 @@ func compareBatchToExpectedDirect(t *testing.T, batch []string, expectedPaths []
 	}
 }
 
-func testScenario(t *testing.T, name string, testCase func(c chan<- fs.Event), expectedBatches []expectedBatch) {
+func testScenario(t *testing.T, name string, testCase func(c chan<- fs.Event), expectedBatches []expectedBatch, evLogger events.Logger) {
 	t.Helper()
+
+	if evLogger == nil {
+		evLogger = events.NoopLogger
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	eventChan := make(chan fs.Event)
 	watchChan := make(chan []string)
 
 	folderCfg := defaultFolderCfg.Copy()
 	folderCfg.ID = name
-	a := newAggregator(folderCfg, ctx)
+	a := newAggregator(ctx, folderCfg)
 	a.notifyTimeout = testNotifyTimeout
 
 	startTime := time.Now()
-	go a.mainLoop(eventChan, watchChan, defaultCfg)
+	go a.mainLoop(eventChan, watchChan, defaultCfg, evLogger)
 
 	sleepMs(20)
 
@@ -295,7 +329,7 @@ func testAggregatorOutput(t *testing.T, fsWatchChan <-chan []string, expectedBat
 			continue
 		}
 
-		if runtime.GOOS != "darwin" {
+		if !build.IsDarwin {
 			now := time.Since(startTime)
 			if innerIndex == 0 {
 				switch {

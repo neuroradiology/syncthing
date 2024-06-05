@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -18,8 +19,11 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-const replicationReadTimeout = time.Minute
-const replicationHeartbeatInterval = time.Second * 30
+const (
+	replicationReadTimeout       = time.Minute
+	replicationWriteTimeout      = 30 * time.Second
+	replicationHeartbeatInterval = time.Second * 30
+)
 
 type replicator interface {
 	send(key string, addrs []DatabaseAddress, seen int64)
@@ -32,7 +36,6 @@ type replicationSender struct {
 	cert       tls.Certificate // our certificate
 	allowedIDs []protocol.DeviceID
 	outbox     chan ReplicationRecord
-	stop       chan struct{}
 }
 
 func newReplicationSender(dst string, cert tls.Certificate, allowedIDs []protocol.DeviceID) *replicationSender {
@@ -41,11 +44,10 @@ func newReplicationSender(dst string, cert tls.Certificate, allowedIDs []protoco
 		cert:       cert,
 		allowedIDs: allowedIDs,
 		outbox:     make(chan ReplicationRecord, replicationOutboxSize),
-		stop:       make(chan struct{}),
 	}
 }
 
-func (s *replicationSender) Serve() {
+func (s *replicationSender) Serve(ctx context.Context) error {
 	// Sleep a little at startup. Peers often restart at the same time, and
 	// this avoid the service failing and entering backoff state
 	// unnecessarily, while also reducing the reconnect rate to something
@@ -62,24 +64,30 @@ func (s *replicationSender) Serve() {
 	conn, err := tls.Dial("tcp", s.dst, tlsCfg)
 	if err != nil {
 		log.Println("Replication connect:", err)
-		return
+		return err
 	}
 	defer func() {
 		conn.SetWriteDeadline(time.Now().Add(time.Second))
 		conn.Close()
 	}()
 
+	// The replication stream is not especially latency sensitive, but it is
+	// quite a lot of data in small writes. Make it more efficient.
+	if tcpc, ok := conn.NetConn().(*net.TCPConn); ok {
+		_ = tcpc.SetNoDelay(false)
+	}
+
 	// Get the other side device ID.
 	remoteID, err := deviceID(conn)
 	if err != nil {
 		log.Println("Replication connect:", err)
-		return
+		return err
 	}
 
 	// Verify it's in the set of allowed device IDs.
 	if !deviceIDIn(remoteID, s.allowedIDs) {
 		log.Println("Replication connect: unexpected device ID:", remoteID)
-		return
+		return err
 	}
 
 	heartBeatTicker := time.NewTicker(replicationHeartbeatInterval)
@@ -117,23 +125,19 @@ func (s *replicationSender) Serve() {
 			binary.BigEndian.PutUint32(buf, uint32(n))
 
 			// Send
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(replicationWriteTimeout))
 			if _, err := conn.Write(buf[:4+n]); err != nil {
 				replicationSendsTotal.WithLabelValues("error").Inc()
 				log.Println("Replication write:", err)
-				// Yes, we are loosing the replication event here.
-				return
+				// Yes, we are losing the replication event here.
+				return err
 			}
 			replicationSendsTotal.WithLabelValues("success").Inc()
 
-		case <-s.stop:
-			return
+		case <-ctx.Done():
+			return nil
 		}
 	}
-}
-
-func (s *replicationSender) Stop() {
-	close(s.stop)
 }
 
 func (s *replicationSender) String() string {
@@ -144,6 +148,7 @@ func (s *replicationSender) send(key string, ps []DatabaseAddress, seen int64) {
 	item := ReplicationRecord{
 		Key:       key,
 		Addresses: ps,
+		Seen:      seen,
 	}
 
 	// The send should never block. The inbox is suitably buffered for at
@@ -172,7 +177,6 @@ type replicationListener struct {
 	cert       tls.Certificate
 	allowedIDs []protocol.DeviceID
 	db         database
-	stop       chan struct{}
 }
 
 func newReplicationListener(addr string, cert tls.Certificate, allowedIDs []protocol.DeviceID, db database) *replicationListener {
@@ -181,11 +185,10 @@ func newReplicationListener(addr string, cert tls.Certificate, allowedIDs []prot
 		cert:       cert,
 		allowedIDs: allowedIDs,
 		db:         db,
-		stop:       make(chan struct{}),
 	}
 }
 
-func (l *replicationListener) Serve() {
+func (l *replicationListener) Serve(ctx context.Context) error {
 	tlsCfg := &tls.Config{
 		Certificates:       []tls.Certificate{l.cert},
 		ClientAuth:         tls.RequestClientCert,
@@ -196,14 +199,14 @@ func (l *replicationListener) Serve() {
 	lst, err := tls.Listen("tcp", l.addr, tlsCfg)
 	if err != nil {
 		log.Println("Replication listen:", err)
-		return
+		return err
 	}
 	defer lst.Close()
 
 	for {
 		select {
-		case <-l.stop:
-			return
+		case <-ctx.Done():
+			return nil
 		default:
 		}
 
@@ -211,7 +214,7 @@ func (l *replicationListener) Serve() {
 		conn, err := lst.Accept()
 		if err != nil {
 			log.Println("Replication accept:", err)
-			return
+			return err
 		}
 
 		// Figure out the other side device ID
@@ -231,19 +234,15 @@ func (l *replicationListener) Serve() {
 			continue
 		}
 
-		go l.handle(conn)
+		go l.handle(ctx, conn)
 	}
-}
-
-func (l *replicationListener) Stop() {
-	close(l.stop)
 }
 
 func (l *replicationListener) String() string {
 	return fmt.Sprintf("replicationListener(%q)", l.addr)
 }
 
-func (l *replicationListener) handle(conn net.Conn) {
+func (l *replicationListener) handle(ctx context.Context, conn net.Conn) {
 	defer func() {
 		conn.SetWriteDeadline(time.Now().Add(time.Second))
 		conn.Close()
@@ -253,7 +252,7 @@ func (l *replicationListener) handle(conn net.Conn) {
 
 	for {
 		select {
-		case <-l.stop:
+		case <-ctx.Done():
 			return
 		default:
 		}

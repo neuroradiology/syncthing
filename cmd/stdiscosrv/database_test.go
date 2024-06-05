@@ -7,21 +7,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
 
 func TestDatabaseGetSet(t *testing.T) {
-	os.RemoveAll("_database")
-	defer os.RemoveAll("_database")
-	db, err := newLevelDBStore("_database")
+	db, err := newMemoryLevelDBStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	go db.Serve()
-	defer db.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	go db.Serve(ctx)
+	defer cancel()
 
 	// Check missing record
 
@@ -117,7 +116,7 @@ func TestDatabaseGetSet(t *testing.T) {
 
 	// Put a record with misses
 
-	rec = DatabaseRecord{Misses: 42}
+	rec = DatabaseRecord{Misses: 42, Missed: tc.Now().UnixNano()}
 	if err := db.put("efgh", rec); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +185,7 @@ func TestFilter(t *testing.T) {
 		},
 		{
 			a: []DatabaseAddress{{Address: "a", Expires: 5}, {Address: "b", Expires: 15}, {Address: "c", Expires: 5}, {Address: "d", Expires: 15}, {Address: "e", Expires: 5}},
-			b: []DatabaseAddress{{Address: "d", Expires: 15}, {Address: "b", Expires: 15}}, // gets reordered
+			b: []DatabaseAddress{{Address: "b", Expires: 15}, {Address: "d", Expires: 15}},
 		},
 	}
 
@@ -207,5 +206,6 @@ func (t *testClock) wind(d time.Duration) {
 }
 
 func (t *testClock) Now() time.Time {
+	t.now = t.now.Add(time.Nanosecond)
 	return t.now
 }

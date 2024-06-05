@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"log"
@@ -13,12 +14,16 @@ import (
 	"path/filepath"
 	"time"
 
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/client"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 )
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -53,13 +58,13 @@ func main() {
 
 	if join {
 		log.Println("Creating client")
-		relay, err := client.NewClient(uri, []tls.Certificate{cert}, nil, 10*time.Second)
+		relay, err := client.NewClient(uri, []tls.Certificate{cert}, 10*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Println("Created client")
 
-		go relay.Serve()
+		go relay.Serve(ctx)
 
 		recv := make(chan protocol.SessionInvitation)
 
@@ -76,7 +81,7 @@ func main() {
 		}()
 
 		for {
-			conn, err := client.JoinSession(<-recv)
+			conn, err := client.JoinSession(ctx, <-recv)
 			if err != nil {
 				log.Fatalln("Failed to join", err)
 			}
@@ -90,13 +95,13 @@ func main() {
 			log.Fatal(err)
 		}
 
-		invite, err := client.GetInvitationFromRelay(uri, id, []tls.Certificate{cert}, 10*time.Second)
+		invite, err := client.GetInvitationFromRelay(ctx, uri, id, []tls.Certificate{cert}, 10*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		log.Println("Received invitation", invite)
-		conn, err := client.JoinSession(invite)
+		conn, err := client.JoinSession(ctx, invite)
 		if err != nil {
 			log.Fatalln("Failed to join", err)
 		}
@@ -104,10 +109,10 @@ func main() {
 		connectToStdio(stdin, conn)
 		log.Println("Finished", conn.RemoteAddr(), conn.LocalAddr())
 	} else if test {
-		if client.TestRelay(uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4) {
+		if err := client.TestRelay(ctx, uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4); err == nil {
 			log.Println("OK")
 		} else {
-			log.Println("FAIL")
+			log.Println("FAIL:", err)
 		}
 	} else {
 		log.Fatal("Requires either join or connect")
@@ -123,10 +128,6 @@ func stdinReader(c chan<- string) {
 }
 
 func connectToStdio(stdin <-chan string, conn net.Conn) {
-	go func() {
-
-	}()
-
 	buf := make([]byte, 1024)
 	for {
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond))

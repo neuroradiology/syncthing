@@ -7,10 +7,12 @@
 package nat
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
 	"net"
+	"slices"
 	stdsync "sync"
 	"time"
 
@@ -22,58 +24,90 @@ import (
 // Service runs a loop for discovery of IGDs (Internet Gateway Devices) and
 // setup/renewal of a port mapping.
 type Service struct {
-	id   protocol.DeviceID
-	cfg  *config.Wrapper
-	stop chan struct{}
+	id               protocol.DeviceID
+	cfg              config.Wrapper
+	processScheduled chan struct{}
 
 	mappings []*Mapping
-	timer    *time.Timer
+	enabled  bool
 	mut      sync.RWMutex
 }
 
-func NewService(id protocol.DeviceID, cfg *config.Wrapper) *Service {
-	return &Service{
-		id:  id,
-		cfg: cfg,
+func NewService(id protocol.DeviceID, cfg config.Wrapper) *Service {
+	s := &Service{
+		id:               id,
+		cfg:              cfg,
+		processScheduled: make(chan struct{}, 1),
 
-		timer: time.NewTimer(0),
-		mut:   sync.NewRWMutex(),
+		mut: sync.NewRWMutex(),
 	}
+	cfgCopy := cfg.RawCopy()
+	s.CommitConfiguration(cfgCopy, cfgCopy)
+	return s
 }
 
-func (s *Service) Serve() {
+func (s *Service) CommitConfiguration(_, to config.Configuration) bool {
+	s.mut.Lock()
+	if !s.enabled && to.Options.NATEnabled {
+		l.Debugln("Starting NAT service")
+		s.enabled = true
+		s.scheduleProcess()
+	} else if s.enabled && !to.Options.NATEnabled {
+		l.Debugln("Stopping NAT service")
+		s.enabled = false
+	}
+	s.mut.Unlock()
+	return true
+}
+
+func (s *Service) Serve(ctx context.Context) error {
+	s.cfg.Subscribe(s)
+	defer s.cfg.Unsubscribe(s)
+
 	announce := stdsync.Once{}
 
-	s.mut.Lock()
-	s.timer.Reset(0)
-	s.stop = make(chan struct{})
-	s.mut.Unlock()
+	timer := time.NewTimer(0)
 
 	for {
 		select {
-		case <-s.timer.C:
-			if found := s.process(); found != -1 {
-				announce.Do(func() {
-					suffix := "s"
-					if found == 1 {
-						suffix = ""
-					}
-					l.Infoln("Detected", found, "NAT service"+suffix)
-				})
+		case <-timer.C:
+		case <-s.processScheduled:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-		case <-s.stop:
-			s.timer.Stop()
+		case <-ctx.Done():
+			timer.Stop()
 			s.mut.RLock()
 			for _, mapping := range s.mappings {
 				mapping.clearAddresses()
 			}
 			s.mut.RUnlock()
-			return
+			return ctx.Err()
+		}
+		s.mut.RLock()
+		enabled := s.enabled
+		s.mut.RUnlock()
+		if !enabled {
+			continue
+		}
+		found, renewIn := s.process(ctx)
+		timer.Reset(renewIn)
+		if found != -1 {
+			announce.Do(func() {
+				suffix := "s"
+				if found == 1 {
+					suffix = ""
+				}
+				l.Infoln("Detected", found, "NAT service"+suffix)
+			})
 		}
 	}
 }
 
-func (s *Service) process() int {
+func (s *Service) process(ctx context.Context) (int, time.Duration) {
 	// toRenew are mappings which are due for renewal
 	// toUpdate are the remaining mappings, which will only be updated if one of
 	// the old IGDs has gone away, or a new IGD has appeared, but only if we
@@ -88,68 +122,63 @@ func (s *Service) process() int {
 
 	s.mut.RLock()
 	for _, mapping := range s.mappings {
-		if mapping.expires.Before(time.Now()) {
+		mapping.mut.RLock()
+		expires := mapping.expires
+		mapping.mut.RUnlock()
+
+		if expires.Before(time.Now()) {
 			toRenew = append(toRenew, mapping)
 		} else {
 			toUpdate = append(toUpdate, mapping)
-			mappingRenewIn := mapping.expires.Sub(time.Now())
+			mappingRenewIn := time.Until(expires)
 			if mappingRenewIn < renewIn {
 				renewIn = mappingRenewIn
 			}
 		}
 	}
-	// Reset the timer while holding the lock, because of the following race:
-	// T1: process acquires lock
-	// T1: process checks the mappings and gets next renewal time in 30m
-	// T2: process releases the lock
-	// T2: NewMapping acquires the lock
-	// T2: NewMapping adds mapping
-	// T2: NewMapping releases the lock
-	// T2: NewMapping resets timer to 1s
-	// T1: process resets timer to 30
-	s.timer.Reset(renewIn)
 	s.mut.RUnlock()
 
 	// Don't do anything, unless we really need to renew
 	if len(toRenew) == 0 {
-		return -1
+		return -1, renewIn
 	}
 
-	nats := discoverAll(time.Duration(s.cfg.Options().NATRenewalM)*time.Minute, time.Duration(s.cfg.Options().NATTimeoutS)*time.Second)
+	nats := discoverAll(ctx, time.Duration(s.cfg.Options().NATRenewalM)*time.Minute, time.Duration(s.cfg.Options().NATTimeoutS)*time.Second)
 
 	for _, mapping := range toRenew {
-		s.updateMapping(mapping, nats, true)
+		s.updateMapping(ctx, mapping, nats, true)
 	}
 
 	for _, mapping := range toUpdate {
-		s.updateMapping(mapping, nats, false)
+		s.updateMapping(ctx, mapping, nats, false)
 	}
 
-	return len(nats)
+	return len(nats), renewIn
 }
 
-func (s *Service) Stop() {
-	s.mut.RLock()
-	close(s.stop)
-	s.mut.RUnlock()
+func (s *Service) scheduleProcess() {
+	select {
+	case s.processScheduled <- struct{}{}: // 1-buffered
+	default:
+	}
 }
 
-func (s *Service) NewMapping(protocol Protocol, ip net.IP, port int) *Mapping {
+func (s *Service) NewMapping(protocol Protocol, ipVersion IPVersion, ip net.IP, port int) *Mapping {
 	mapping := &Mapping{
 		protocol: protocol,
 		address: Address{
 			IP:   ip,
 			Port: port,
 		},
-		extAddresses: make(map[string]Address),
+		extAddresses: make(map[string][]Address),
 		mut:          sync.NewRWMutex(),
+		ipVersion:    ipVersion,
 	}
 
 	s.mut.Lock()
 	s.mappings = append(s.mappings, mapping)
-	// Reset the timer while holding the lock, see process() for explanation
-	s.timer.Reset(time.Second)
 	s.mut.Unlock()
+	s.scheduleProcess()
 
 	return mapping
 }
@@ -178,121 +207,154 @@ func (s *Service) RemoveMapping(mapping *Mapping) {
 // acquire mappings for natds which the mapping was unaware of before.
 // Optionally takes renew flag which indicates whether or not we should renew
 // mappings with existing natds
-func (s *Service) updateMapping(mapping *Mapping, nats map[string]Device, renew bool) {
-	var added, removed []Address
-
+func (s *Service) updateMapping(ctx context.Context, mapping *Mapping, nats map[string]Device, renew bool) {
 	renewalTime := time.Duration(s.cfg.Options().NATRenewalM) * time.Minute
+
+	mapping.mut.Lock()
+
 	mapping.expires = time.Now().Add(renewalTime)
+	change := s.verifyExistingLocked(ctx, mapping, nats, renew)
+	add := s.acquireNewLocked(ctx, mapping, nats)
 
-	newAdded, newRemoved := s.verifyExistingMappings(mapping, nats, renew)
-	added = append(added, newAdded...)
-	removed = append(removed, newRemoved...)
+	mapping.mut.Unlock()
 
-	newAdded, newRemoved = s.acquireNewMappings(mapping, nats)
-	added = append(added, newAdded...)
-	removed = append(removed, newRemoved...)
-
-	if len(added) > 0 || len(removed) > 0 {
-		mapping.notify(added, removed)
+	if change || add {
+		mapping.notify()
 	}
 }
 
-func (s *Service) verifyExistingMappings(mapping *Mapping, nats map[string]Device, renew bool) ([]Address, []Address) {
-	var added, removed []Address
-
+func (s *Service) verifyExistingLocked(ctx context.Context, mapping *Mapping, nats map[string]Device, renew bool) (change bool) {
 	leaseTime := time.Duration(s.cfg.Options().NATLeaseM) * time.Minute
 
-	for id, address := range mapping.addressMap() {
-		// Delete addresses for NATDevice's that do not exist anymore
-		nat, ok := nats[id]
-		if !ok {
-			mapping.removeAddress(id)
-			removed = append(removed, address)
+	for id, extAddrs := range mapping.extAddresses {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		if nat, ok := nats[id]; !ok || len(extAddrs) == 0 {
+			// Delete addresses for NATDevice's that do not exist anymore
+			mapping.removeAddressLocked(id)
+			change = true
 			continue
 		} else if renew {
 			// Only perform renewals on the nat's that have the right local IP
-			// address
-			localIP := nat.GetLocalIPAddress()
-			if !mapping.validGateway(localIP) {
+			// address. For IPv6 the IP addresses are discovered by the service itself,
+			// so this check is skipped.
+			localIP := nat.GetLocalIPv4Address()
+			if !mapping.validGateway(localIP) && nat.SupportsIPVersion(IPv4Only) {
 				l.Debugf("Skipping %s for %s because of IP mismatch. %s != %s", id, mapping, mapping.address.IP, localIP)
 				continue
 			}
 
-			l.Debugf("Renewing %s -> %s mapping on %s", mapping, address, id)
-
-			addr, err := s.tryNATDevice(nat, mapping.address.Port, address.Port, leaseTime)
-			if err != nil {
-				l.Debugf("Failed to renew %s -> mapping on %s", mapping, address, id)
-				mapping.removeAddress(id)
-				removed = append(removed, address)
+			if !nat.SupportsIPVersion(mapping.ipVersion) {
+				l.Debugf("Skipping renew on gateway %s because it doesn't match the listener address family", nat.ID())
 				continue
 			}
 
-			l.Debugf("Renewed %s -> %s mapping on %s", mapping, address, id)
+			l.Debugf("Renewing %s -> %v open port on %s", mapping, extAddrs, id)
+			// extAddrs either contains one IPv4 address, or possibly several
+			// IPv6 addresses all using the same port.  Therefore the first
+			// entry always has the external port.
+			responseAddrs, err := s.tryNATDevice(ctx, nat, mapping.address, extAddrs[0].Port, leaseTime)
+			if err != nil {
+				l.Debugf("Failed to renew %s -> %v open port on %s", mapping, extAddrs, id)
+				mapping.removeAddressLocked(id)
+				change = true
+				continue
+			}
 
-			if !addr.Equal(address) {
-				mapping.removeAddress(id)
-				mapping.setAddress(id, addr)
-				removed = append(removed, address)
-				added = append(added, address)
+			l.Debugf("Renewed %s -> %v open port on %s", mapping, extAddrs, id)
+
+			// We shouldn't rely on the order in which the addresses are returned.
+			// Therefore, we test for set equality and report change if there is any difference.
+			if !addrSetsEqual(responseAddrs, extAddrs) {
+				mapping.setAddressLocked(id, responseAddrs)
+				change = true
 			}
 		}
 	}
 
-	return added, removed
+	return change
 }
 
-func (s *Service) acquireNewMappings(mapping *Mapping, nats map[string]Device) ([]Address, []Address) {
-	var added, removed []Address
-
+func (s *Service) acquireNewLocked(ctx context.Context, mapping *Mapping, nats map[string]Device) (change bool) {
 	leaseTime := time.Duration(s.cfg.Options().NATLeaseM) * time.Minute
-	addrMap := mapping.addressMap()
+	addrMap := mapping.extAddresses
 
 	for id, nat := range nats {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
 		if _, ok := addrMap[id]; ok {
 			continue
 		}
 
 		// Only perform mappings on the nat's that have the right local IP
 		// address
-		localIP := nat.GetLocalIPAddress()
-		if !mapping.validGateway(localIP) {
+		localIP := nat.GetLocalIPv4Address()
+		if !mapping.validGateway(localIP) && nat.SupportsIPVersion(IPv4Only) {
 			l.Debugf("Skipping %s for %s because of IP mismatch. %s != %s", id, mapping, mapping.address.IP, localIP)
 			continue
 		}
 
-		l.Debugf("Acquiring %s mapping on %s", mapping, id)
+		l.Debugf("Trying to open port %s on %s", mapping, id)
 
-		addr, err := s.tryNATDevice(nat, mapping.address.Port, 0, leaseTime)
-		if err != nil {
-			l.Debugf("Failed to acquire %s mapping on %s", mapping, id)
+		if !nat.SupportsIPVersion(mapping.ipVersion) {
+			l.Debugf("Skipping firewall traversal on gateway %s because it doesn't match the listener address family", nat.ID())
 			continue
 		}
 
-		l.Debugf("Acquired %s -> %s mapping on %s", mapping, addr, id)
+		addrs, err := s.tryNATDevice(ctx, nat, mapping.address, 0, leaseTime)
+		if err != nil {
+			l.Debugf("Failed to acquire %s open port on %s", mapping, id)
+			continue
+		}
 
-		mapping.setAddress(id, addr)
-		added = append(added, addr)
+		l.Debugf("Opened port %s -> %v on %s", mapping, addrs, id)
+		mapping.setAddressLocked(id, addrs)
+		change = true
 	}
 
-	return added, removed
+	return change
 }
 
 // tryNATDevice tries to acquire a port mapping for the given internal address to
 // the given external port. If external port is 0, picks a pseudo-random port.
-func (s *Service) tryNATDevice(natd Device, intPort, extPort int, leaseTime time.Duration) (Address, error) {
+func (s *Service) tryNATDevice(ctx context.Context, natd Device, intAddr Address, extPort int, leaseTime time.Duration) ([]Address, error) {
 	var err error
 	var port int
+	// For IPv6, we just try to create the pinhole. If it fails, nothing can be done (probably no IGDv2 support).
+	// If it already exists, the relevant UPnP standard requires that the gateway recognizes this and updates the lease time.
+	// Since we usually have a global unicast IPv6 address so no conflicting mappings, we just request the port we're running on
+	if natd.SupportsIPVersion(IPv6Only) {
+		ipaddrs, err := natd.AddPinhole(ctx, TCP, intAddr, leaseTime)
+		var addrs []Address
+		for _, ipaddr := range ipaddrs {
+			addrs = append(addrs, Address{
+				ipaddr,
+				intAddr.Port,
+			})
+		}
 
+		if err != nil {
+			l.Debugln("Error extending lease on", natd.ID(), err)
+		}
+		return addrs, err
+	}
 	// Generate a predictable random which is based on device ID + local port + hash of the device ID
 	// number so that the ports we'd try to acquire for the mapping would always be the same for the
 	// same device trying to get the same internal port.
-	predictableRand := rand.New(rand.NewSource(int64(s.id.Short()) + int64(intPort) + hash(natd.ID())))
+	predictableRand := rand.New(rand.NewSource(int64(s.id.Short()) + int64(intAddr.Port) + hash(natd.ID())))
 
 	if extPort != 0 {
 		// First try renewing our existing mapping, if we have one.
 		name := fmt.Sprintf("syncthing-%d", extPort)
-		port, err = natd.AddPortMapping(TCP, intPort, extPort, name, leaseTime)
+		port, err = natd.AddPortMapping(ctx, TCP, intAddr.Port, extPort, name, leaseTime)
 		if err == nil {
 			extPort = port
 			goto findIP
@@ -301,33 +363,59 @@ func (s *Service) tryNATDevice(natd Device, intPort, extPort int, leaseTime time
 	}
 
 	for i := 0; i < 10; i++ {
+		select {
+		case <-ctx.Done():
+			return []Address{}, ctx.Err()
+		default:
+		}
+
 		// Then try up to ten random ports.
 		extPort = 1024 + predictableRand.Intn(65535-1024)
 		name := fmt.Sprintf("syncthing-%d", extPort)
-		port, err = natd.AddPortMapping(TCP, intPort, extPort, name, leaseTime)
+		port, err = natd.AddPortMapping(ctx, TCP, intAddr.Port, extPort, name, leaseTime)
 		if err == nil {
 			extPort = port
 			goto findIP
 		}
-		l.Debugln("Error getting new lease on", natd.ID(), err)
+		l.Debugf("Error getting new lease on %s: %s", natd.ID(), err)
 	}
 
-	return Address{}, err
+	return nil, err
 
 findIP:
-	ip, err := natd.GetExternalIPAddress()
+	ip, err := natd.GetExternalIPv4Address(ctx)
 	if err != nil {
-		l.Debugln("Error getting external ip on", natd.ID(), err)
+		l.Debugf("Error getting external ip on %s: %s", natd.ID(), err)
 		ip = nil
 	}
-	return Address{
-		IP:   ip,
-		Port: extPort,
+	return []Address{
+		{
+			IP:   ip,
+			Port: extPort,
+		},
 	}, nil
+}
+
+func (s *Service) String() string {
+	return fmt.Sprintf("nat.Service@%p", s)
 }
 
 func hash(input string) int64 {
 	h := fnv.New64a()
 	h.Write([]byte(input))
 	return int64(h.Sum64())
+}
+
+func addrSetsEqual(a []Address, b []Address) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for _, v := range a {
+		if !slices.ContainsFunc(b, v.Equal) {
+			return false
+		}
+	}
+
+	return true
 }

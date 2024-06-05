@@ -7,22 +7,32 @@
 package pmp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"time"
 
-	"github.com/AudriusButkevicius/go-nat-pmp"
 	"github.com/jackpal/gateway"
+	natpmp "github.com/jackpal/go-nat-pmp"
+
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
 	nat.Register(Discover)
 }
 
-func Discover(renewal, timeout time.Duration) []nat.Device {
-	ip, err := gateway.DiscoverGateway()
+func Discover(ctx context.Context, renewal, timeout time.Duration) []nat.Device {
+	var ip net.IP
+	err := svcutil.CallWithContext(ctx, func() error {
+		var err error
+		ip, err = gateway.DiscoverGateway()
+		return err
+	})
 	if err != nil {
 		l.Debugln("Failed to discover gateway", err)
 		return nil
@@ -33,24 +43,32 @@ func Discover(renewal, timeout time.Duration) []nat.Device {
 
 	l.Debugln("Discovered gateway at", ip)
 
-	c := natpmp.NewClient(ip, timeout)
+	c := natpmp.NewClientWithTimeout(ip, timeout)
 	// Try contacting the gateway, if it does not respond, assume it does not
 	// speak NAT-PMP.
-	_, err = c.GetExternalAddress()
-	if err != nil && strings.Contains(err.Error(), "Timed out") {
-		l.Debugln("Timeout trying to get external address, assume no NAT-PMP available")
-		return nil
+	err = svcutil.CallWithContext(ctx, func() error {
+		_, ierr := c.GetExternalAddress()
+		return ierr
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if strings.Contains(err.Error(), "Timed out") {
+			l.Debugln("Timeout trying to get external address, assume no NAT-PMP available")
+			return nil
+		}
 	}
 
 	var localIP net.IP
 	// Port comes from the natpmp package
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip.String(), "5351"), timeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(timeoutCtx, "udp", net.JoinHostPort(ip.String(), "5351"))
 	if err == nil {
 		conn.Close()
-		localIPAddress, _, err := net.SplitHostPort(conn.LocalAddr().String())
-		if err == nil {
-			localIP = net.ParseIP(localIPAddress)
-		} else {
+		localIP, err = osutil.IPFromAddr(conn.LocalAddr())
+		if localIP == nil {
 			l.Debugln("Failed to lookup local IP", err)
 		}
 	}
@@ -74,18 +92,23 @@ func (w *wrapper) ID() string {
 	return fmt.Sprintf("NAT-PMP@%s", w.gatewayIP.String())
 }
 
-func (w *wrapper) GetLocalIPAddress() net.IP {
+func (w *wrapper) GetLocalIPv4Address() net.IP {
 	return w.localIP
 }
 
-func (w *wrapper) AddPortMapping(protocol nat.Protocol, internalPort, externalPort int, description string, duration time.Duration) (int, error) {
+func (w *wrapper) AddPortMapping(ctx context.Context, protocol nat.Protocol, internalPort, externalPort int, _ string, duration time.Duration) (int, error) {
 	// NAT-PMP says that if duration is 0, the mapping is actually removed
 	// Swap the zero with the renewal value, which should make the lease for the
 	// exact amount of time between the calls.
 	if duration == 0 {
 		duration = w.renewal
 	}
-	result, err := w.client.AddPortMapping(strings.ToLower(string(protocol)), internalPort, externalPort, int(duration/time.Second))
+	var result *natpmp.AddPortMappingResult
+	err := svcutil.CallWithContext(ctx, func() error {
+		var err error
+		result, err = w.client.AddPortMapping(strings.ToLower(string(protocol)), internalPort, externalPort, int(duration/time.Second))
+		return err
+	})
 	port := 0
 	if result != nil {
 		port = int(result.MappedExternalPort)
@@ -93,8 +116,24 @@ func (w *wrapper) AddPortMapping(protocol nat.Protocol, internalPort, externalPo
 	return port, err
 }
 
-func (w *wrapper) GetExternalIPAddress() (net.IP, error) {
-	result, err := w.client.GetExternalAddress()
+func (*wrapper) AddPinhole(_ context.Context, _ nat.Protocol, _ nat.Address, _ time.Duration) ([]net.IP, error) {
+	// NAT-PMP doesn't support pinholes.
+	return nil, errors.New("adding IPv6 pinholes is unsupported on NAT-PMP")
+}
+
+func (*wrapper) SupportsIPVersion(version nat.IPVersion) bool {
+	// NAT-PMP gateways should always try to create port mappings and not pinholes
+	// since NAT-PMP doesn't support IPv6.
+	return version == nat.IPvAny || version == nat.IPv4Only
+}
+
+func (w *wrapper) GetExternalIPv4Address(ctx context.Context) (net.IP, error) {
+	var result *natpmp.GetExternalAddressResult
+	err := svcutil.CallWithContext(ctx, func() error {
+		var err error
+		result, err = w.client.GetExternalAddress()
+		return err
+	})
 	ip := net.IPv4zero
 	if result != nil {
 		ip = net.IPv4(

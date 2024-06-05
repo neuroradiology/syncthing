@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -13,43 +14,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/osutil"
+	_ "github.com/syncthing/syncthing/lib/pmp"
+	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/tlsutil"
-	"golang.org/x/time/rate"
-
-	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/nat"
-	_ "github.com/syncthing/syncthing/lib/pmp"
 	_ "github.com/syncthing/syncthing/lib/upnp"
-
-	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
+	"golang.org/x/time/rate"
 )
-
-var (
-	Version    string
-	BuildStamp string
-	BuildUser  string
-	BuildHost  string
-
-	BuildDate   time.Time
-	LongVersion string
-)
-
-func init() {
-	stamp, _ := strconv.Atoi(BuildStamp)
-	BuildDate = time.Unix(int64(stamp), 0)
-
-	date := BuildDate.UTC().Format("2006-01-02 15:04:05 MST")
-	LongVersion = fmt.Sprintf(`strelaysrv %s (%s %s-%s) %s@%s %s`, Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildUser, BuildHost, date)
-}
 
 var (
 	listen string
@@ -66,13 +48,14 @@ var (
 
 	sessionLimitBps   int
 	globalLimitBps    int
-	overLimit         int32
+	overLimit         atomic.Bool
 	descriptorLimit   int64
 	sessionLimiter    *rate.Limiter
 	globalLimiter     *rate.Limiter
 	networkBufferSize int
 
 	statusAddr       string
+	token            string
 	poolAddrs        string
 	pools            []string
 	providedBy       string
@@ -106,6 +89,7 @@ func main() {
 	flag.IntVar(&globalLimitBps, "global-rate", globalLimitBps, "Global rate limit, in bytes/s")
 	flag.BoolVar(&debug, "debug", debug, "Enable debug output")
 	flag.StringVar(&statusAddr, "status-srv", ":22070", "Listen address for status service (blank to disable)")
+	flag.StringVar(&token, "token", "", "Token to restrict access to the relay (optional). Disables joining any pools.")
 	flag.StringVar(&poolAddrs, "pools", defaultPoolAddrs, "Comma separated list of relay pool addresses to join")
 	flag.StringVar(&providedBy, "provided-by", "", "An optional description about who provides the relay")
 	flag.StringVar(&extAddress, "ext-address", "", "An optional address to advertise as being available on.\n\tAllows listening on an unprivileged port with port forwarding from e.g. 443, and be connected to on port 443.")
@@ -115,8 +99,15 @@ func main() {
 	flag.IntVar(&natRenewal, "nat-renewal", 30, "NAT renewal frequency in minutes")
 	flag.IntVar(&natTimeout, "nat-timeout", 10, "NAT discovery timeout in seconds")
 	flag.BoolVar(&pprofEnabled, "pprof", false, "Enable the built in profiling on the status server")
-	flag.IntVar(&networkBufferSize, "network-buffer", 2048, "Network buffer size (two of these per proxied connection)")
+	flag.IntVar(&networkBufferSize, "network-buffer", 65536, "Network buffer size (two of these per proxied connection)")
+	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
+
+	longVer := build.LongVersionFor("strelaysrv")
+	if *showVersion {
+		fmt.Println(longVer)
+		return
+	}
 
 	if extAddress == "" {
 		extAddress = listen
@@ -146,7 +137,7 @@ func main() {
 		}
 	}
 
-	log.Println(LongVersion)
+	log.Println(longVer)
 
 	maxDescriptors, err := osutil.MaximizeOpenFileLimit()
 	if maxDescriptors > 0 {
@@ -155,7 +146,7 @@ func main() {
 		log.Println("Connection limit", descriptorLimit)
 
 		go monitorLimits()
-	} else if err != nil && runtime.GOOS != "windows" {
+	} else if err != nil && !build.IsWindows {
 		log.Println("Assuming no connection limit, due to error retrieving rlimits:", err)
 	}
 
@@ -166,7 +157,7 @@ func main() {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Println("Failed to load keypair. Generating one, this might take a while...")
-		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv")
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv", 20*365)
 		if err != nil {
 			log.Fatalln("Failed to generate X509 key pair:", err)
 		}
@@ -194,19 +185,30 @@ func main() {
 		log.Println("ID:", id)
 	}
 
-	wrapper := config.Wrap("config", config.New(id))
-	wrapper.SetOptions(config.OptionsConfiguration{
-		NATLeaseM:   natLease,
-		NATRenewalM: natRenewal,
-		NATTimeoutS: natTimeout,
+	wrapper := config.Wrap("config", config.New(id), id, events.NoopLogger)
+	go wrapper.Serve(context.TODO())
+	wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.NATLeaseM = natLease
+		cfg.Options.NATRenewalM = natRenewal
+		cfg.Options.NATTimeoutS = natTimeout
 	})
 	natSvc := nat.NewService(id, wrapper)
-	mapping := mapping{natSvc.NewMapping(nat.TCP, addr.IP, addr.Port)}
+	var ipVersion nat.IPVersion
+	if strings.HasSuffix(proto, "4") {
+		ipVersion = nat.IPv4Only
+	} else if strings.HasSuffix(proto, "6") {
+		ipVersion = nat.IPv6Only
+	} else {
+		ipVersion = nat.IPvAny
+	}
+	mapping := mapping{natSvc.NewMapping(nat.TCP, ipVersion, addr.IP, addr.Port)}
 
 	if natEnabled {
-		go natSvc.Serve()
+		ctx, cancel := context.WithCancel(context.Background())
+		go natSvc.Serve(ctx)
+		defer cancel()
 		found := make(chan struct{})
-		mapping.OnChanged(func(_ *nat.Mapping, _, _ []nat.Address) {
+		mapping.OnChanged(func() {
 			select {
 			case found <- struct{}{}:
 			default:
@@ -236,12 +238,36 @@ func main() {
 		go statusService(statusAddr)
 	}
 
-	uri, err := url.Parse(fmt.Sprintf("relay://%s/?id=%s&pingInterval=%s&networkTimeout=%s&sessionLimitBps=%d&globalLimitBps=%d&statusAddr=%s&providedBy=%s", mapping.Address(), id, pingInterval, networkTimeout, sessionLimitBps, globalLimitBps, statusAddr, providedBy))
+	uri, err := url.Parse(fmt.Sprintf("relay://%s/", mapping.Address()))
 	if err != nil {
 		log.Fatalln("Failed to construct URI", err)
+		return
 	}
 
+	// Add properly encoded query string parameters to URL.
+	query := make(url.Values)
+	query.Set("id", id.String())
+	query.Set("pingInterval", pingInterval.String())
+	query.Set("networkTimeout", networkTimeout.String())
+	if sessionLimitBps > 0 {
+		query.Set("sessionLimitBps", fmt.Sprint(sessionLimitBps))
+	}
+	if globalLimitBps > 0 {
+		query.Set("globalLimitBps", fmt.Sprint(globalLimitBps))
+	}
+	if statusAddr != "" {
+		query.Set("statusAddr", statusAddr)
+	}
+	if providedBy != "" {
+		query.Set("providedBy", providedBy)
+	}
+	uri.RawQuery = query.Encode()
+
 	log.Println("URI:", uri.String())
+
+	if token != "" {
+		poolAddrs = ""
+	}
 
 	if poolAddrs == defaultPoolAddrs {
 		log.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -254,11 +280,11 @@ func main() {
 	for _, pool := range pools {
 		pool = strings.TrimSpace(pool)
 		if len(pool) > 0 {
-			go poolHandler(pool, uri, mapping)
+			go poolHandler(pool, uri, mapping, cert)
 		}
 	}
 
-	go listener(proto, listen, tlsCfg)
+	go listener(proto, listen, tlsCfg, token)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -289,10 +315,10 @@ func main() {
 func monitorLimits() {
 	limitCheckTimer = time.NewTimer(time.Minute)
 	for range limitCheckTimer.C {
-		if atomic.LoadInt64(&numConnections)+atomic.LoadInt64(&numProxies) > descriptorLimit {
-			atomic.StoreInt32(&overLimit, 1)
+		if numConnections.Load()+numProxies.Load() > descriptorLimit {
+			overLimit.Store(true)
 			log.Println("Gone past our connection limits. Starting to refuse new/drop idle connections.")
-		} else if atomic.CompareAndSwapInt32(&overLimit, 1, 0) {
+		} else if overLimit.CompareAndSwap(true, false) {
 			log.Println("Dropped below our connection limits. Accepting new connections.")
 		}
 		limitCheckTimer.Reset(time.Minute)

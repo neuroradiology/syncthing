@@ -7,25 +7,21 @@
 package model
 
 import (
-	"os"
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/sync"
 )
 
 // Test creating temporary file inside read-only directory
 func TestReadOnlyDir(t *testing.T) {
-	// Create a read only directory, clean it up afterwards.
-	os.Mkdir("testdata/read_only_dir", 0555)
-	defer func() {
-		os.Chmod("testdata/read_only_dir", 0755)
-		os.RemoveAll("testdata/read_only_dir")
-	}()
+	ffs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32))
+	ffs.Mkdir("testdir", 0o555)
 
 	s := sharedPullerState{
-		fs:       fs.NewFilesystem(fs.FilesystemTypeBasic, "testdata"),
-		tempName: "read_only_dir/.temp_name",
+		fs:       ffs,
+		tempName: "testdir/.temp_name",
 		mut:      sync.NewRWMutex(),
 	}
 
@@ -37,6 +33,6 @@ func TestReadOnlyDir(t *testing.T) {
 		t.Fatal("Unexpected nil fd")
 	}
 
-	s.fail("Test done", nil)
+	s.fail(nil)
 	s.finalClose()
 }

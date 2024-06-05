@@ -9,10 +9,10 @@ package main
 import (
 	"flag"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/signature"
 	"github.com/syncthing/syncthing/lib/upgrade"
 )
@@ -69,7 +69,7 @@ func gen() {
 }
 
 func sign(keyname, dataname string) {
-	privkey, err := ioutil.ReadFile(keyname)
+	privkey, err := os.ReadFile(keyname)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func sign(keyname, dataname string) {
 }
 
 func verifyWithFile(signame, dataname, keyname string) {
-	pubkey, err := ioutil.ReadFile(keyname)
+	pubkey, err := os.ReadFile(keyname)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func verifyWithFile(signame, dataname, keyname string) {
 }
 
 func verifyWithKey(signame, dataname string, pubkey []byte) {
-	sig, err := ioutil.ReadFile(signame)
+	sig, err := os.ReadFile(signame)
 	if err != nil {
 		log.Fatal(err)
 	}

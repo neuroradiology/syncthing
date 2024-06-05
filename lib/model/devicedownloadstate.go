@@ -16,8 +16,9 @@ import (
 // FileInfo.Blocks that the remote device already has, and version represents
 // the version of the file that the remote device is downloading.
 type deviceFolderFileDownloadState struct {
-	blockIndexes []int32
+	blockIndexes []int
 	version      protocol.Vector
+	blockSize    int
 }
 
 // deviceFolderDownloadState holds current download state of all files that
@@ -29,7 +30,7 @@ type deviceFolderDownloadState struct {
 
 // Has returns whether a block at that specific index, and that specific version of the file
 // is currently available on the remote device for pulling from a temporary file.
-func (p *deviceFolderDownloadState) Has(file string, version protocol.Vector, index int32) bool {
+func (p *deviceFolderDownloadState) Has(file string, version protocol.Vector, index int) bool {
 	p.mut.RLock()
 	defer p.mut.RUnlock()
 
@@ -55,23 +56,42 @@ func (p *deviceFolderDownloadState) Update(updates []protocol.FileDownloadProgre
 
 	for _, update := range updates {
 		local, ok := p.files[update.Name]
-		if update.UpdateType == protocol.UpdateTypeForget && ok && local.version.Equal(update.Version) {
+		if update.UpdateType == protocol.FileDownloadProgressUpdateTypeForget && ok && local.version.Equal(update.Version) {
 			delete(p.files, update.Name)
-		} else if update.UpdateType == protocol.UpdateTypeAppend {
+		} else if update.UpdateType == protocol.FileDownloadProgressUpdateTypeAppend {
 			if !ok {
 				local = deviceFolderFileDownloadState{
 					blockIndexes: update.BlockIndexes,
 					version:      update.Version,
+					blockSize:    int(update.BlockSize),
 				}
 			} else if !local.version.Equal(update.Version) {
 				local.blockIndexes = append(local.blockIndexes[:0], update.BlockIndexes...)
 				local.version = update.Version
+				local.blockSize = int(update.BlockSize)
 			} else {
 				local.blockIndexes = append(local.blockIndexes, update.BlockIndexes...)
 			}
 			p.files[update.Name] = local
 		}
 	}
+}
+
+func (p *deviceFolderDownloadState) BytesDownloaded() int64 {
+	p.mut.RLock()
+	defer p.mut.RUnlock()
+
+	var res int64
+	for _, state := range p.files {
+		// BlockSize is a new field introduced in 1.4.1, thus a fallback
+		// is required (will potentially underrepresent downloaded bytes).
+		if state.blockSize != 0 {
+			res += int64(len(state.blockIndexes) * state.blockSize)
+		} else {
+			res += int64(len(state.blockIndexes) * protocol.MinBlockSize)
+		}
+	}
+	return res
 }
 
 // GetBlockCounts returns a map filename -> number of blocks downloaded.
@@ -117,7 +137,7 @@ func (t *deviceDownloadState) Update(folder string, updates []protocol.FileDownl
 
 // Has returns whether block at that specific index, and that specific version of the file
 // is currently available on the remote device for pulling from a temporary file.
-func (t *deviceDownloadState) Has(folder, file string, version protocol.Vector, index int32) bool {
+func (t *deviceDownloadState) Has(folder, file string, version protocol.Vector, index int) bool {
 	if t == nil {
 		return false
 	}
@@ -148,6 +168,22 @@ func (t *deviceDownloadState) GetBlockCounts(folder string) map[string]int {
 		}
 	}
 	return nil
+}
+
+func (t *deviceDownloadState) BytesDownloaded(folder string) int64 {
+	if t == nil {
+		return 0
+	}
+
+	t.mut.RLock()
+	defer t.mut.RUnlock()
+
+	for name, state := range t.folders {
+		if name == folder {
+			return state.BytesDownloaded()
+		}
+	}
+	return 0
 }
 
 func newDeviceDownloadState() *deviceDownloadState {

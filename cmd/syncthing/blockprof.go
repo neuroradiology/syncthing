@@ -15,18 +15,20 @@ import (
 	"time"
 )
 
-func init() {
-	if innerProcess && os.Getenv("STBLOCKPROFILE") != "" {
-		profiler := pprof.Lookup("block")
-		if profiler == nil {
-			panic("Couldn't find block profiler")
-		}
-		l.Debugln("Starting block profiling")
-		go saveBlockingProfiles(profiler)
+func startBlockProfiler() {
+	profiler := pprof.Lookup("block")
+	if profiler == nil {
+		panic("Couldn't find block profiler")
 	}
+	l.Debugln("Starting block profiling")
+	go func() {
+		err := saveBlockingProfiles(profiler) // Only returns on error
+		l.Warnln("Block profiler failed:", err)
+		panic("Block profiler failed")
+	}()
 }
 
-func saveBlockingProfiles(profiler *pprof.Profile) {
+func saveBlockingProfiles(profiler *pprof.Profile) error {
 	runtime.SetBlockProfileRate(1)
 
 	t0 := time.Now()
@@ -35,16 +37,16 @@ func saveBlockingProfiles(profiler *pprof.Profile) {
 
 		fd, err := os.Create(fmt.Sprintf("block-%05d-%07d.pprof", syscall.Getpid(), startms))
 		if err != nil {
-			panic(err)
+			return err
 		}
 		err = profiler.WriteTo(fd, 0)
 		if err != nil {
-			panic(err)
+			return err
 		}
 		err = fd.Close()
 		if err != nil {
-			panic(err)
+			return err
 		}
-
 	}
+	return nil
 }

@@ -3,39 +3,51 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net/url"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/relay/protocol"
-)
+	"github.com/syncthing/syncthing/lib/svcutil"
 
-type relayClientFactory func(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) RelayClient
-
-var (
-	supportedSchemes = map[string]relayClientFactory{
-		"relay":         newStaticClient,
-		"dynamic+http":  newDynamicClient,
-		"dynamic+https": newDynamicClient,
-	}
+	"github.com/thejerf/suture/v4"
 )
 
 type RelayClient interface {
-	Serve()
-	Stop()
+	suture.Service
 	Error() error
-	Latency() time.Duration
 	String() string
-	Invitations() chan protocol.SessionInvitation
+	Invitations() <-chan protocol.SessionInvitation
 	URI() *url.URL
 }
 
-func NewClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) (RelayClient, error) {
-	factory, ok := supportedSchemes[uri.Scheme]
-	if !ok {
-		return nil, fmt.Errorf("Unsupported scheme: %s", uri.Scheme)
-	}
+func NewClient(uri *url.URL, certs []tls.Certificate, timeout time.Duration) (RelayClient, error) {
+	invitations := make(chan protocol.SessionInvitation)
 
-	return factory(uri, certs, invitations, timeout), nil
+	switch uri.Scheme {
+	case "relay":
+		return newStaticClient(uri, certs, invitations, timeout), nil
+	case "dynamic+http", "dynamic+https":
+		return newDynamicClient(uri, certs, invitations, timeout), nil
+	default:
+		return nil, fmt.Errorf("unsupported scheme: %s", uri.Scheme)
+	}
+}
+
+type commonClient struct {
+	svcutil.ServiceWithError
+	invitations chan protocol.SessionInvitation
+}
+
+func newCommonClient(invitations chan protocol.SessionInvitation, serve func(context.Context) error, creator string) commonClient {
+	return commonClient{
+		ServiceWithError: svcutil.AsService(serve, creator),
+		invitations:      invitations,
+	}
+}
+
+func (c *commonClient) Invitations() <-chan protocol.SessionInvitation {
+	return c.invitations
 }

@@ -4,16 +4,22 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate go run ../../script/protofmt.go database.proto
-//go:generate protoc -I ../../../../../ -I ../../vendor/ -I ../../vendor/github.com/gogo/protobuf/protobuf -I . --gogofast_out=. database.proto
+//go:generate go run ../../proto/scripts/protofmt.go database.proto
+//go:generate protoc -I ../../ -I . --gogofast_out=. database.proto
 
 package main
 
 import (
+	"context"
+	"log"
+	"net"
+	"net/url"
 	"sort"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/sliceutil"
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/storage"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
@@ -36,7 +42,6 @@ type database interface {
 type levelDBStore struct {
 	db         *leveldb.DB
 	inbox      chan func()
-	stop       chan struct{}
 	clock      clock
 	marshalBuf []byte
 }
@@ -49,7 +54,18 @@ func newLevelDBStore(dir string) (*levelDBStore, error) {
 	return &levelDBStore{
 		db:    db,
 		inbox: make(chan func(), 16),
-		stop:  make(chan struct{}),
+		clock: defaultClock{},
+	}, nil
+}
+
+func newMemoryLevelDBStore() (*levelDBStore, error) {
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return &levelDBStore{
+		db:    db,
+		inbox: make(chan func(), 16),
 		clock: defaultClock{},
 	}, nil
 }
@@ -154,7 +170,7 @@ func (s *levelDBStore) get(key string) (DatabaseRecord, error) {
 	return rec, nil
 }
 
-func (s *levelDBStore) Serve() {
+func (s *levelDBStore) Serve(ctx context.Context) error {
 	t := time.NewTimer(0)
 	defer t.Stop()
 	defer s.db.Close()
@@ -182,7 +198,7 @@ loop:
 			// the next.
 			t.Reset(databaseStatisticsInterval)
 
-		case <-s.stop:
+		case <-ctx.Done():
 			// We're done.
 			close(statisticsTrigger)
 			break loop
@@ -191,6 +207,8 @@ loop:
 
 	// Also wait for statisticsServe to return
 	<-statisticsDone
+
+	return nil
 }
 
 func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- struct{}) {
@@ -202,7 +220,7 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 		cutoff24h := t0.Add(-24 * time.Hour).UnixNano()
 		cutoff1w := t0.Add(-7 * 24 * time.Hour).UnixNano()
 		cutoff2Mon := t0.Add(-60 * 24 * time.Hour).UnixNano()
-		current, last24h, last1w, inactive, errors := 0, 0, 0, 0, 0
+		current, currentIPv4, currentIPv6, last24h, last1w, inactive, errors := 0, 0, 0, 0, 0, 0, 0
 
 		iter := s.db.NewIterator(&util.Range{}, nil)
 		for iter.Next() {
@@ -217,9 +235,35 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 			// If there are addresses that have not expired it's a current
 			// record, otherwise account it based on when it was last seen
 			// (last 24 hours or last week) or finally as inactice.
+			addrs := expire(rec.Addresses, nowNanos)
 			switch {
-			case len(expire(rec.Addresses, nowNanos)) > 0:
+			case len(addrs) > 0:
 				current++
+				seenIPv4, seenIPv6 := false, false
+				for _, addr := range addrs {
+					uri, err := url.Parse(addr.Address)
+					if err != nil {
+						continue
+					}
+					host, _, err := net.SplitHostPort(uri.Host)
+					if err != nil {
+						continue
+					}
+					if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+						seenIPv4 = true
+					} else if ip != nil {
+						seenIPv6 = true
+					}
+					if seenIPv4 && seenIPv6 {
+						break
+					}
+				}
+				if seenIPv4 {
+					currentIPv4++
+				}
+				if seenIPv6 {
+					currentIPv6++
+				}
 			case rec.Seen > cutoff24h:
 				last24h++
 			case rec.Seen > cutoff1w:
@@ -243,6 +287,8 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 		iter.Release()
 
 		databaseKeys.WithLabelValues("current").Set(float64(current))
+		databaseKeys.WithLabelValues("currentIPv4").Set(float64(currentIPv4))
+		databaseKeys.WithLabelValues("currentIPv6").Set(float64(currentIPv6))
 		databaseKeys.WithLabelValues("last24h").Set(float64(last24h))
 		databaseKeys.WithLabelValues("last1w").Set(float64(last1w))
 		databaseKeys.WithLabelValues("inactive").Set(float64(inactive))
@@ -254,21 +300,20 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 	}
 }
 
-func (s *levelDBStore) Stop() {
-	close(s.stop)
-}
-
 // merge returns the merged result of the two database records a and b. The
 // result is the union of the two address sets, with the newer expiry time
 // chosen for any duplicates.
 func merge(a, b DatabaseRecord) DatabaseRecord {
 	// Both lists must be sorted for this to work.
-	sort.Slice(a.Addresses, func(i, j int) bool {
-		return a.Addresses[i].Address < a.Addresses[j].Address
-	})
-	sort.Slice(b.Addresses, func(i, j int) bool {
-		return b.Addresses[i].Address < b.Addresses[j].Address
-	})
+	if !sort.IsSorted(databaseAddressOrder(a.Addresses)) {
+		log.Println("Warning: bug: addresses not correctly sorted in merge")
+		a.Addresses = sortedAddressCopy(a.Addresses)
+	}
+	if !sort.IsSorted(databaseAddressOrder(b.Addresses)) {
+		// no warning because this is the side we read from disk and it may
+		// legitimately predate correct sorting.
+		b.Addresses = sortedAddressCopy(b.Addresses)
+	}
 
 	res := DatabaseRecord{
 		Addresses: make([]DatabaseAddress, 0, len(a.Addresses)+len(b.Addresses)),
@@ -338,17 +383,31 @@ func expire(addrs []DatabaseAddress, now int64) []DatabaseAddress {
 	i := 0
 	for i < len(addrs) {
 		if addrs[i].Expires < now {
-			// This item is expired. Replace it with the last in the list
-			// (noop if we are at the last item).
-			addrs[i] = addrs[len(addrs)-1]
-			// Wipe the last item of the list to release references to
-			// strings and stuff.
-			addrs[len(addrs)-1] = DatabaseAddress{}
-			// Shorten the slice.
-			addrs = addrs[:len(addrs)-1]
+			addrs = sliceutil.RemoveAndZero(addrs, i)
 			continue
 		}
 		i++
 	}
 	return addrs
+}
+
+func sortedAddressCopy(addrs []DatabaseAddress) []DatabaseAddress {
+	sorted := make([]DatabaseAddress, len(addrs))
+	copy(sorted, addrs)
+	sort.Sort(databaseAddressOrder(sorted))
+	return sorted
+}
+
+type databaseAddressOrder []DatabaseAddress
+
+func (s databaseAddressOrder) Less(a, b int) bool {
+	return s[a].Address < s[b].Address
+}
+
+func (s databaseAddressOrder) Swap(a, b int) {
+	s[a], s[b] = s[b], s[a]
+}
+
+func (s databaseAddressOrder) Len() int {
+	return len(s)
 }

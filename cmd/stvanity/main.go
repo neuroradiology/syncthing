@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -36,14 +38,14 @@ type result struct {
 
 func main() {
 	flag.Parse()
-	prefix := strings.ToUpper(strings.Replace(flag.Arg(0), "-", "", -1))
+	prefix := strings.ToUpper(strings.ReplaceAll(flag.Arg(0), "-", ""))
 	if len(prefix) > 7 {
 		prefix = prefix[:7] + "-" + prefix[7:]
 	}
 
 	found := make(chan result)
 	stop := make(chan struct{})
-	var count int64
+	var count atomic.Int64
 
 	// Print periodic progress reports.
 	go printProgress(prefix, &count)
@@ -71,7 +73,7 @@ func main() {
 // Try certificates until one is found that has the prefix at the start of
 // the resulting device ID. Increments count atomically, sends the result to
 // found, returns when stop is closed.
-func generatePrefixed(prefix string, count *int64, found chan<- result, stop <-chan struct{}) {
+func generatePrefixed(prefix string, count *atomic.Int64, found chan<- result, stop <-chan struct{}) {
 	notBefore := time.Now()
 	notAfter := time.Date(2049, 12, 31, 23, 59, 59, 0, time.UTC)
 
@@ -108,7 +110,7 @@ func generatePrefixed(prefix string, count *int64, found chan<- result, stop <-c
 		}
 
 		id := protocol.NewDeviceID(derBytes)
-		atomic.AddInt64(count, 1)
+		count.Add(1)
 
 		if strings.HasPrefix(id.String(), prefix) {
 			select {
@@ -120,7 +122,7 @@ func generatePrefixed(prefix string, count *int64, found chan<- result, stop <-c
 	}
 }
 
-func printProgress(prefix string, count *int64) {
+func printProgress(prefix string, count *atomic.Int64) {
 	started := time.Now()
 	wantBits := 5 * len(prefix)
 	if wantBits > 63 {
@@ -131,7 +133,7 @@ func printProgress(prefix string, count *int64) {
 	fmt.Printf("Want %d bits for prefix %q, about %.2g certs to test (statistically speaking)\n", wantBits, prefix, expectedIterations)
 
 	for range time.NewTicker(15 * time.Second).C {
-		tried := atomic.LoadInt64(count)
+		tried := count.Load()
 		elapsed := time.Since(started)
 		rate := float64(tried) / elapsed.Seconds()
 		expected := timeStr(expectedIterations / rate)
@@ -156,7 +158,7 @@ func saveCert(priv interface{}, derBytes []byte) {
 		os.Exit(1)
 	}
 
-	keyOut, err := os.OpenFile("key.pem", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyOut, err := os.OpenFile("key.pem", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -191,7 +193,7 @@ func pemBlockForKey(priv interface{}) (*pem.Block, error) {
 		}
 		return &pem.Block{Type: "EC PRIVATE KEY", Bytes: b}, nil
 	default:
-		return nil, fmt.Errorf("unknown key type")
+		return nil, errors.New("unknown key type")
 	}
 }
 

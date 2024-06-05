@@ -14,14 +14,9 @@ import (
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
-type Size struct {
-	Value float64 `json:"value" xml:",chardata"`
-	Unit  string  `json:"unit" xml:"unit,attr"`
-}
-
 func ParseSize(s string) (Size, error) {
 	s = strings.TrimSpace(s)
-	if len(s) == 0 {
+	if s == "" {
 		return Size{}, nil
 	}
 
@@ -72,24 +67,52 @@ func (s Size) String() string {
 	return fmt.Sprintf("%v %s", s.Value, s.Unit)
 }
 
-func (Size) ParseDefault(s string) (interface{}, error) {
-	return ParseSize(s)
+func (s *Size) ParseDefault(str string) error {
+	sz, err := ParseSize(str)
+	*s = sz
+	return err
 }
 
-func checkFreeSpace(req Size, usage fs.Usage) error {
-	val := req.BaseValue()
+// CheckFreeSpace checks that the free space does not fall below the minimum required free space.
+func CheckFreeSpace(minFree Size, usage fs.Usage) error {
+	val := minFree.BaseValue()
 	if val <= 0 {
 		return nil
 	}
 
-	if req.Percentage() {
+	if minFree.Percentage() {
 		freePct := (float64(usage.Free) / float64(usage.Total)) * 100
 		if freePct < val {
-			return fmt.Errorf("%f %% < %v", freePct, req)
+			return fmt.Errorf("current %.2f %% < required %v", freePct, minFree)
 		}
 	} else if float64(usage.Free) < val {
-		return fmt.Errorf("%v < %v", usage.Free, req)
+		return fmt.Errorf("current %sB < required %v", formatSI(usage.Free), minFree)
 	}
 
 	return nil
+}
+
+// checkAvailableSpace checks that the free space does not fall below the minimum
+// required free space, considering additional required space for a future operation.
+func checkAvailableSpace(req uint64, minFree Size, usage fs.Usage) error {
+	if usage.Free < req {
+		return fmt.Errorf("current %sB < required %sB", formatSI(usage.Free), formatSI(req))
+	}
+	usage.Free -= req
+	return CheckFreeSpace(minFree, usage)
+}
+
+func formatSI(b uint64) string {
+	switch {
+	case b < 1000:
+		return fmt.Sprintf("%d ", b)
+	case b < 1000*1000:
+		return fmt.Sprintf("%.1f K", float64(b)/1000)
+	case b < 1000*1000*1000:
+		return fmt.Sprintf("%.1f M", float64(b)/(1000*1000))
+	case b < 1000*1000*1000*1000:
+		return fmt.Sprintf("%.1f G", float64(b)/(1000*1000*1000))
+	default:
+		return fmt.Sprintf("%.1f T", float64(b)/(1000*1000*1000*1000))
+	}
 }

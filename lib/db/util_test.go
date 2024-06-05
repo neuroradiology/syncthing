@@ -10,35 +10,45 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"testing"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/syncthing/syncthing/lib/db/backend"
+	"github.com/syncthing/syncthing/lib/events"
 )
 
 // writeJSONS serializes the database to a JSON stream that can be checked
 // in to the repo and used for tests.
-func writeJSONS(w io.Writer, db *leveldb.DB) {
-	it := db.NewIterator(&util.Range{}, nil)
+func writeJSONS(w io.Writer, db backend.Backend) {
+	it, err := db.NewPrefixIterator(nil)
+	if err != nil {
+		panic(err)
+	}
 	defer it.Release()
 	enc := json.NewEncoder(w)
 	for it.Next() {
-		enc.Encode(map[string][]byte{
+		err := enc.Encode(map[string][]byte{
 			"k": it.Key(),
 			"v": it.Value(),
 		})
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
-// openJSONS reads a JSON stream file into a leveldb.DB
-func openJSONS(file string) (*leveldb.DB, error) {
+// we know this function isn't generally used, nonetheless we want it in
+// here and the linter to not complain.
+var _ = writeJSONS
+
+// openJSONS reads a JSON stream file into a backend DB
+func openJSONS(file string) (backend.Backend, error) {
 	fd, err := os.Open(file)
 	if err != nil {
 		return nil, err
 	}
 	dec := json.NewDecoder(fd)
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db := backend.OpenMemory()
 
 	for {
 		var row map[string][]byte
@@ -50,10 +60,43 @@ func openJSONS(file string) (*leveldb.DB, error) {
 			return nil, err
 		}
 
-		db.Put(row["k"], row["v"], nil)
+		if err := db.Put(row["k"], row["v"]); err != nil {
+			return nil, err
+		}
 	}
 
 	return db, nil
+}
+
+func newLowlevel(t testing.TB, backend backend.Backend) *Lowlevel {
+	t.Helper()
+	ll, err := NewLowlevel(backend, events.NoopLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ll
+}
+
+func newLowlevelMemory(t testing.TB) *Lowlevel {
+	return newLowlevel(t, backend.OpenMemory())
+}
+
+func newFileSet(t testing.TB, folder string, db *Lowlevel) *FileSet {
+	t.Helper()
+	fset, err := NewFileSet(folder, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fset
+}
+
+func snapshot(t testing.TB, fset *FileSet) *Snapshot {
+	t.Helper()
+	snap, err := fset.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
 }
 
 // The following commented tests were used to generate jsons files to stdout for
@@ -63,7 +106,7 @@ func openJSONS(file string) (*leveldb.DB, error) {
 // local and remote, in the format used in 0.14.48.
 // func TestGenerateIgnoredFilesDB(t *testing.T) {
 // 	db := OpenMemory()
-// 	fs := NewFileSet("test", fs.NewFilesystem(fs.FilesystemTypeBasic, "."), db)
+// 	fs := newFileSet(t, "test", fs.NewFilesystem(fs.FilesystemTypeBasic, "."), db)
 // 	fs.Update(protocol.LocalDeviceID, []protocol.FileInfo{
 // 		{ // invalid (ignored) file
 // 			Name:    "foo",
@@ -98,9 +141,40 @@ func openJSONS(file string) (*leveldb.DB, error) {
 // format used in 0.14.45.
 // func TestGenerateUpdate0to3DB(t *testing.T) {
 // 	db := OpenMemory()
-// 	fs := NewFileSet(update0to3Folder, fs.NewFilesystem(fs.FilesystemTypeBasic, "."), db)
+// 	fs := newFileSet(t, update0to3Folder, fs.NewFilesystem(fs.FilesystemTypeBasic, "."), db)
 // 	for devID, files := range haveUpdate0to3 {
 // 		fs.Update(devID, files)
 // 	}
 // 	writeJSONS(os.Stdout, db.DB)
+// }
+
+// func TestGenerateUpdateTo10(t *testing.T) {
+// 	db := newLowlevelMemory(t)
+// 	defer db.Close()
+
+// 	if err := UpdateSchema(db); err != nil {
+// 		t.Fatal(err)
+// 	}
+
+// 	fs := newFileSet(t, "test", fs.NewFilesystem(fs.FilesystemTypeFake, ""), db)
+
+// 	files := []protocol.FileInfo{
+// 		{Name: "a", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Deleted: true, Sequence: 1},
+// 		{Name: "b", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(2), Sequence: 2},
+// 		{Name: "c", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Deleted: true, Sequence: 3},
+// 	}
+// 	fs.Update(protocol.LocalDeviceID, files)
+// 	files[1].Version = files[1].Version.Update(remoteDevice0.Short())
+// 	files[1].Deleted = true
+// 	files[2].Version = files[2].Version.Update(remoteDevice0.Short())
+// 	files[2].Blocks = genBlocks(1)
+// 	files[2].Deleted = false
+// 	fs.Update(remoteDevice0, files)
+
+// 	fd, err := os.Create("./testdata/v1.4.0-updateTo10.json")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	defer fd.Close()
+// 	writeJSONS(fd, db)
 // }

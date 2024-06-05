@@ -6,13 +6,6 @@
 
 package config
 
-type LDAPConfiguration struct {
-	Address            string        `xml:"address,omitempty" json:"addresd"`
-	BindDN             string        `xml:"bindDN,omitempty" json:"bindDN"`
-	Transport          LDAPTransport `xml:"transport,omitempty" json:"transport"`
-	InsecureSkipVerify bool          `xml:"insecureSkipVerify,omitempty" json:"insecureSkipVerify" default:"false"`
-}
-
 func (c LDAPConfiguration) Copy() LDAPConfiguration {
 	return c
 }

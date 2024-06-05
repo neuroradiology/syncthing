@@ -7,11 +7,13 @@
 package connections
 
 import (
+	"context"
 	"crypto/tls"
 	"net/url"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/client"
@@ -22,17 +24,16 @@ func init() {
 }
 
 type relayDialer struct {
-	cfg    *config.Wrapper
-	tlsCfg *tls.Config
+	commonDialer
 }
 
-func (d *relayDialer) Dial(id protocol.DeviceID, uri *url.URL) (internalConn, error) {
-	inv, err := client.GetInvitationFromRelay(uri, id, d.tlsCfg.Certificates, 10*time.Second)
+func (d *relayDialer) Dial(ctx context.Context, id protocol.DeviceID, uri *url.URL) (internalConn, error) {
+	inv, err := client.GetInvitationFromRelay(ctx, uri, id, d.tlsCfg.Certificates, 10*time.Second)
 	if err != nil {
 		return internalConn{}, err
 	}
 
-	conn, err := client.JoinSession(inv)
+	conn, err := client.JoinSession(ctx, inv)
 	if err != nil {
 		return internalConn{}, err
 	}
@@ -43,7 +44,7 @@ func (d *relayDialer) Dial(id protocol.DeviceID, uri *url.URL) (internalConn, er
 		return internalConn{}, err
 	}
 
-	err = dialer.SetTrafficClass(conn, d.cfg.Options().TrafficClass)
+	err = dialer.SetTrafficClass(conn, d.trafficClass)
 	if err != nil {
 		l.Debugln("Dial (BEP/relay): setting traffic class:", err)
 	}
@@ -61,24 +62,23 @@ func (d *relayDialer) Dial(id protocol.DeviceID, uri *url.URL) (internalConn, er
 		return internalConn{}, err
 	}
 
-	return internalConn{tc, connTypeRelayClient, relayPriority}, nil
+	return newInternalConn(tc, connTypeRelayClient, false, d.wanPriority), nil
 }
 
-func (d *relayDialer) RedialFrequency() time.Duration {
-	return time.Duration(d.cfg.Options().RelayReconnectIntervalM) * time.Minute
+func (d *relayDialer) Priority(_ string) int {
+	return d.wanPriority
 }
 
 type relayDialerFactory struct{}
 
-func (relayDialerFactory) New(cfg *config.Wrapper, tlsCfg *tls.Config) genericDialer {
-	return &relayDialer{
-		cfg:    cfg,
-		tlsCfg: tlsCfg,
-	}
-}
-
-func (relayDialerFactory) Priority() int {
-	return relayPriority
+func (relayDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, _ *registry.Registry, _ *lanChecker) genericDialer {
+	return &relayDialer{commonDialer{
+		trafficClass:      opts.TrafficClass,
+		reconnectInterval: time.Duration(opts.RelayReconnectIntervalM) * time.Minute,
+		tlsCfg:            tlsCfg,
+		wanPriority:       opts.ConnectionPriorityRelay,
+		lanPriority:       opts.ConnectionPriorityRelay,
+	}}
 }
 
 func (relayDialerFactory) AlwaysWAN() bool {

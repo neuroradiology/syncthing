@@ -4,14 +4,20 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"time"
 )
 
-func poolHandler(pool string, uri *url.URL, mapping mapping) {
+const (
+	httpStatusEnhanceYourCalm = 429
+)
+
+func poolHandler(pool string, uri *url.URL, mapping mapping, ownCert tls.Certificate) {
 	if debug {
 		log.Println("Joining", pool)
 	}
@@ -26,40 +32,80 @@ func poolHandler(pool string, uri *url.URL, mapping mapping) {
 			uriCopy.String(),
 		})
 
-		resp, err := httpClient.Post(pool, "application/json", &b)
+		poolUrl, err := url.Parse(pool)
 		if err != nil {
-			log.Println("Error joining pool", pool, err)
-		} else if resp.StatusCode == 500 {
-			bs, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("Failed to join", pool, "due to an internal server error. Could not read response:", err)
-			} else {
-				log.Println("Failed to join", pool, "due to an internal server error:", string(bs))
+			log.Printf("Could not parse pool url '%s': %v", pool, err)
+		}
+
+		client := http.DefaultClient
+		if poolUrl.Scheme == "https" {
+			// Sent our certificate in join request
+			client = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						Certificates: []tls.Certificate{ownCert},
+					},
+				},
 			}
-			resp.Body.Close()
-		} else if resp.StatusCode == 429 {
-			log.Println(pool, "under load, will retry in a minute")
+		}
+
+		resp, err := client.Post(pool, "application/json", &b)
+		if err != nil {
+			log.Printf("Error joining pool %v: HTTP request: %v", pool, err)
 			time.Sleep(time.Minute)
 			continue
-		} else if resp.StatusCode == 401 {
-			log.Println(pool, "failed to join due to IP address not matching external address. Aborting")
-			return
-		} else if resp.StatusCode == 200 {
+		}
+
+		bs, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Printf("Error joining pool %v: reading response: %v", pool, err)
+			time.Sleep(time.Minute)
+			continue
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK:
 			var x struct {
 				EvictionIn time.Duration `json:"evictionIn"`
 			}
-			err := json.NewDecoder(resp.Body).Decode(&x)
-			if err == nil {
+			if err := json.Unmarshal(bs, &x); err == nil {
 				rejoin := x.EvictionIn - (x.EvictionIn / 5)
-				log.Println("Joined", pool, "rejoining in", rejoin)
+				log.Printf("Joined pool %s, rejoining in %v", pool, rejoin)
 				time.Sleep(rejoin)
 				continue
-			} else {
-				log.Println("Failed to deserialize response", err)
 			}
-		} else {
-			log.Println(pool, "unknown response type from server", resp.StatusCode)
+			log.Printf("Joined pool %s, failed to deserialize response: %v", pool, err)
+
+		case http.StatusInternalServerError:
+			log.Printf("Failed to join %v: server error", pool)
+			log.Printf("Response data: %s", bs)
+			time.Sleep(time.Minute)
+			continue
+
+		case http.StatusBadRequest:
+			log.Printf("Failed to join %v: request or check error", pool)
+			log.Printf("Response data: %s", bs)
+			time.Sleep(time.Minute)
+			continue
+
+		case httpStatusEnhanceYourCalm:
+			log.Printf("Failed to join %v: under load (rate limiting)", pool)
+			time.Sleep(time.Minute)
+			continue
+
+		case http.StatusUnauthorized:
+			log.Printf("Failed to join %v: IP address not matching external address", pool)
+			log.Println("Aborting")
+			return
+
+		default:
+			log.Printf("Failed to join %v: unexpected status code from server: %d", pool, resp.StatusCode)
+			log.Printf("Response data: %s", bs)
+			time.Sleep(time.Minute)
+			continue
 		}
+
 		time.Sleep(time.Hour)
 	}
 }

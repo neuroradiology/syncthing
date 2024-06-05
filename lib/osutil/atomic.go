@@ -9,8 +9,8 @@ package osutil
 import (
 	"errors"
 	"path/filepath"
-	"runtime"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
@@ -43,7 +43,7 @@ func CreateAtomic(path string) (*AtomicWriter, error) {
 // permissions.
 func CreateAtomicFilesystem(filesystem fs.Filesystem, path string) (*AtomicWriter, error) {
 	// The security of this depends on the tempfile having secure
-	// permissions, 0600, from the beginning. This is what ioutil.TempFile
+	// permissions, 0600, from the beginning. This is what os.CreateTemp
 	// does. We have a test that verifies that that is the case, should this
 	// ever change in the standard library in the future.
 	fd, err := TempFile(filesystem, filepath.Dir(path), TempPrefix)
@@ -83,29 +83,42 @@ func (w *AtomicWriter) Close() error {
 	// Try to not leave temp file around, but ignore error.
 	defer w.fs.Remove(w.next.Name())
 
-	if err := w.next.Sync(); err != nil {
-		w.err = err
-		return err
-	}
+	// sync() isn't supported everywhere, our best effort will suffice.
+	_ = w.next.Sync()
 
 	if err := w.next.Close(); err != nil {
 		w.err = err
 		return err
 	}
 
-	// Remove the destination file, on Windows only. If it fails, and not due
-	// to the file not existing, we won't be able to complete the rename
-	// either. Return this error because it may be more informative. On non-
-	// Windows we want the atomic rename behavior so we don't attempt remove.
-	if runtime.GOOS == "windows" {
-		if err := w.fs.Remove(w.path); err != nil && !fs.IsNotExist(err) {
-			return err
-		}
+	info, infoErr := w.fs.Lstat(w.path)
+	if infoErr != nil && !fs.IsNotExist(infoErr) {
+		w.err = infoErr
+		return infoErr
 	}
-
-	if err := w.fs.Rename(w.next.Name(), w.path); err != nil {
+	err := w.fs.Rename(w.next.Name(), w.path)
+	if build.IsWindows && fs.IsPermission(err) {
+		// On Windows, we might not be allowed to rename over the file
+		// because it's read-only. Get us some write permissions and try
+		// again.
+		_ = w.fs.Chmod(w.path, 0644)
+		err = w.fs.Rename(w.next.Name(), w.path)
+	}
+	if err != nil {
 		w.err = err
 		return err
+	}
+	if infoErr == nil {
+		// Restore chmod setting for final file to what it was
+		if err := w.fs.Chmod(w.path, info.Mode()); err != nil {
+			// Only fail if permissions differ, since some filesystems are expected to not allow chmod (e.g. error
+			// `operation not permitted`).
+			infoAfterRename, infoAfterRenameErr := w.fs.Lstat(w.path)
+			if infoAfterRenameErr != nil || infoAfterRename.Mode() != info.Mode() {
+				w.err = err
+				return err
+			}
+		}
 	}
 
 	// fsync the directory too

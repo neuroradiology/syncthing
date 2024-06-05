@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
+//go:build integration && benchmark && windows
 // +build integration,benchmark,windows
 
 package integration
@@ -20,9 +21,10 @@ func ftToDuration(ft *syscall.Filetime) time.Duration {
 	return time.Duration(n*100) * time.Nanosecond
 }
 
-func printUsage(name string, proc *os.ProcessState) {
+func printUsage(name string, proc *os.ProcessState, total int64) {
 	if rusage, ok := proc.SysUsage().(*syscall.Rusage); ok {
-		log.Printf("%s: Utime: %s", name, ftToDuration(&rusage.UserTime))
-		log.Printf("%s: Stime: %s", name, ftToDuration(&rusage.KernelTime))
+		mib := total / 1024 / 1024
+		log.Printf("%s: Utime: %s / MiB", name, time.Duration(rusage.UserTime.Nanoseconds()/mib))
+		log.Printf("%s: Stime: %s / MiB", name, time.Duration(rusage.KernelTime.Nanoseconds()/mib))
 	}
 }

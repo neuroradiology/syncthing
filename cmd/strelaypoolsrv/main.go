@@ -1,20 +1,15 @@
 // Copyright (C) 2015 Audrius Butkevicius and Contributors (see the CONTRIBUTORS file).
 
-//go:generate go run ../../script/genassets.go gui >auto/gui.go
-
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"math/rand"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,17 +17,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/groupcache/lru"
-	"github.com/oschwald/geoip2-golang"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/syncthing/syncthing/cmd/strelaypoolsrv/auto"
+	"github.com/syncthing/syncthing/lib/assets"
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
+	"github.com/syncthing/syncthing/lib/geoip"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/client"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
-	"golang.org/x/time/rate"
 )
 
 type location struct {
@@ -49,6 +47,10 @@ type relay struct {
 	uri            *url.URL
 	Stats          *stats    `json:"stats"`
 	StatsRetrieved time.Time `json:"statsRetrieved"`
+}
+
+type relayShort struct {
+	URL string `json:"url"`
 }
 
 type stats struct {
@@ -92,38 +94,29 @@ type result struct {
 }
 
 var (
-	testCert        tls.Certificate
-	knownRelaysFile = filepath.Join(os.TempDir(), "strelaypoolsrv_known_relays")
-	listen          = ":80"
-	dir             string
-	evictionTime    = time.Hour
-	debug           bool
-	getLRUSize      = 10 << 10
-	getLimitBurst   = 10
-	getLimitAvg     = 2
-	postLRUSize     = 1 << 10
-	postLimitBurst  = 2
-	postLimitAvg    = 2
-	getLimit        time.Duration
-	postLimit       time.Duration
-	permRelaysFile  string
-	ipHeader        string
-	geoipPath       string
-	proto           string
-	statsRefresh    = time.Minute / 2
+	testCert          tls.Certificate
+	knownRelaysFile   = filepath.Join(os.TempDir(), "strelaypoolsrv_known_relays")
+	listen            = ":80"
+	metricsListen     = ":8081"
+	dir               string
+	evictionTime      = time.Hour
+	debug             bool
+	permRelaysFile    string
+	ipHeader          string
+	proto             string
+	statsRefresh      = time.Minute
+	requestQueueLen   = 64
+	requestProcessors = 8
+	geoipLicenseKey   = os.Getenv("GEOIP_LICENSE_KEY")
+	geoipAccountID, _ = strconv.Atoi(os.Getenv("GEOIP_ACCOUNT_ID"))
 
-	getMut      = sync.NewRWMutex()
-	getLRUCache *lru.Cache
-
-	postMut      = sync.NewRWMutex()
-	postLRUCache *lru.Cache
-
-	requests = make(chan request, 10)
+	requests chan request
 
 	mut             = sync.NewRWMutex()
 	knownRelays     = make([]*relay, 0)
 	permanentRelays = make([]*relay, 0)
 	evictionTimers  = make(map[string]*time.Timer)
+	globalBlocklist = newErrorTracker(1000)
 )
 
 const (
@@ -131,46 +124,49 @@ const (
 )
 
 func main() {
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Lshortfile)
+
 	flag.StringVar(&listen, "listen", listen, "Listen address")
+	flag.StringVar(&metricsListen, "metrics-listen", metricsListen, "Metrics listen address")
 	flag.StringVar(&dir, "keys", dir, "Directory where http-cert.pem and http-key.pem is stored for TLS listening")
 	flag.BoolVar(&debug, "debug", debug, "Enable debug output")
 	flag.DurationVar(&evictionTime, "eviction", evictionTime, "After how long the relay is evicted")
-	flag.IntVar(&getLRUSize, "get-limit-cache", getLRUSize, "Get request limiter cache size")
-	flag.IntVar(&getLimitAvg, "get-limit-avg", getLimitAvg, "Allowed average get request rate, per 10 s")
-	flag.IntVar(&getLimitBurst, "get-limit-burst", getLimitBurst, "Allowed burst get requests")
-	flag.IntVar(&postLRUSize, "post-limit-cache", postLRUSize, "Post request limiter cache size")
-	flag.IntVar(&postLimitAvg, "post-limit-avg", postLimitAvg, "Allowed average post request rate, per minute")
-	flag.IntVar(&postLimitBurst, "post-limit-burst", postLimitBurst, "Allowed burst post requests")
 	flag.StringVar(&permRelaysFile, "perm-relays", "", "Path to list of permanent relays")
+	flag.StringVar(&knownRelaysFile, "known-relays", knownRelaysFile, "Path to list of current relays")
 	flag.StringVar(&ipHeader, "ip-header", "", "Name of header which holds clients ip:port. Only meaningful when running behind a reverse proxy.")
-	flag.StringVar(&geoipPath, "geoip", "GeoLite2-City.mmdb", "Path to GeoLite2-City database")
 	flag.StringVar(&proto, "protocol", "tcp", "Protocol used for listening. 'tcp' for IPv4 and IPv6, 'tcp4' for IPv4, 'tcp6' for IPv6")
 	flag.DurationVar(&statsRefresh, "stats-refresh", statsRefresh, "Interval at which to refresh relay stats")
+	flag.IntVar(&requestQueueLen, "request-queue", requestQueueLen, "Queue length for incoming test requests")
+	flag.IntVar(&requestProcessors, "request-processors", requestProcessors, "Number of request processor routines")
+	flag.StringVar(&geoipLicenseKey, "geoip-license-key", geoipLicenseKey, "License key for GeoIP database")
 
 	flag.Parse()
 
-	getLimit = 10 * time.Second / time.Duration(getLimitAvg)
-	postLimit = time.Minute / time.Duration(postLimitAvg)
-
-	getLRUCache = lru.New(getLRUSize)
-	postLRUCache = lru.New(postLRUSize)
+	requests = make(chan request, requestQueueLen)
+	geoip, err := geoip.NewGeoLite2CityProvider(context.Background(), geoipAccountID, geoipLicenseKey, os.TempDir())
+	if err != nil {
+		log.Fatalln("Failed to create GeoIP provider:", err)
+	}
+	go geoip.Serve(context.TODO())
 
 	var listener net.Listener
-	var err error
 
 	if permRelaysFile != "" {
-		permanentRelays = loadRelays(permRelaysFile)
+		permanentRelays = loadRelays(permRelaysFile, geoip)
 	}
 
 	testCert = createTestCertificate()
 
-	go requestProcessor()
+	for i := 0; i < requestProcessors; i++ {
+		go requestProcessor(geoip)
+	}
 
 	// Load relays from cache in the background.
 	// Load them in a serial fashion to make sure any genuine requests
 	// are not dropped.
 	go func() {
-		for _, relay := range loadRelays(knownRelaysFile) {
+		for _, relay := range loadRelays(knownRelaysFile, geoip) {
 			resultChan := make(chan result)
 			requests <- request{relay, resultChan, nil}
 			result := <-resultChan
@@ -198,6 +194,7 @@ func main() {
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS10, // No SSLv3
+			ClientAuth:   tls.RequestClientCert,
 			CipherSuites: []uint16{
 				// No RC4
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -225,15 +222,40 @@ func main() {
 		log.Fatalln("listen:", err)
 	}
 
-	handler := http.NewServeMux()
-	handler.HandleFunc("/", handleAssets)
-	handler.HandleFunc("/endpoint", handleRequest)
-	handler.HandleFunc("/metrics", handleMetrics)
+	if metricsListen != "" {
+		mmux := http.NewServeMux()
+		mmux.HandleFunc("/metrics", handleMetrics)
+		go func() {
+			if err := http.ListenAndServe(metricsListen, mmux); err != nil {
+				log.Fatalln("HTTP serve metrics:", err)
+			}
+		}()
+	}
+
+	getMux := http.NewServeMux()
+	getMux.HandleFunc("/", handleAssets)
+	getMux.HandleFunc("/endpoint", withAPIMetrics(handleEndpointShort))
+	getMux.HandleFunc("/endpoint/full", withAPIMetrics(handleEndpointFull))
+
+	postMux := http.NewServeMux()
+	postMux.HandleFunc("/endpoint", withAPIMetrics(handleRegister))
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			getMux.ServeHTTP(w, r)
+		case http.MethodPost:
+			postMux.ServeHTTP(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 
 	srv := http.Server{
 		Handler:     handler,
 		ReadTimeout: 10 * time.Second,
 	}
+	srv.SetKeepAlivesEnabled(false)
 
 	err = srv.Serve(listener)
 	if err != nil {
@@ -253,134 +275,97 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 func handleAssets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 
-	assets := auto.Assets()
 	path := r.URL.Path[1:]
 	if path == "" {
 		path = "index.html"
 	}
 
-	bs, ok := assets[path]
+	as, ok := auto.Assets()[path]
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	etag := fmt.Sprintf("%d", auto.Generated)
-	modified := time.Unix(auto.Generated, 0).UTC()
-
-	w.Header().Set("Last-Modified", modified.Format(http.TimeFormat))
-	w.Header().Set("Etag", etag)
-
-	mtype := mimeTypeForFile(path)
-	if len(mtype) != 0 {
-		w.Header().Set("Content-Type", mtype)
-	}
-
-	if t, err := time.Parse(http.TimeFormat, r.Header.Get("If-Modified-Since")); err == nil && modified.Add(time.Second).After(t) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
-	if match := r.Header.Get("If-None-Match"); match != "" {
-		if strings.Contains(match, etag) {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-	}
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		w.Header().Set("Content-Encoding", "gzip")
-	} else {
-		// ungzip if browser not send gzip accepted header
-		var gr *gzip.Reader
-		gr, _ = gzip.NewReader(bytes.NewReader(bs))
-		bs, _ = ioutil.ReadAll(gr)
-		gr.Close()
-	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bs)))
-
-	w.Write(bs)
+	assets.Serve(w, r, as)
 }
 
-func mimeTypeForFile(file string) string {
-	// We use a built in table of the common types since the system
-	// TypeByExtension might be unreliable. But if we don't know, we delegate
-	// to the system.
-	ext := filepath.Ext(file)
-	switch ext {
-	case ".htm", ".html":
-		return "text/html"
-	case ".css":
-		return "text/css"
-	case ".js":
-		return "application/javascript"
-	case ".json":
-		return "application/json"
-	case ".png":
-		return "image/png"
-	case ".ttf":
-		return "application/x-font-ttf"
-	case ".woff":
-		return "application/x-font-woff"
-	case ".svg":
-		return "image/svg+xml"
-	default:
-		return mime.TypeByExtension(ext)
+func withAPIMetrics(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		timer := prometheus.NewTimer(apiRequestsSeconds.WithLabelValues(r.Method))
+		w = NewLoggingResponseWriter(w)
+		defer func() {
+			timer.ObserveDuration()
+			lw := w.(*loggingResponseWriter)
+			apiRequestsTotal.WithLabelValues(r.Method, strconv.Itoa(lw.statusCode)).Inc()
+		}()
+		next(w, r)
 	}
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-	timer := prometheus.NewTimer(apiRequestsSeconds.WithLabelValues(r.Method))
+// handleEndpointFull returns the relay list with full metadata and
+// statistics. Large, and expensive.
+func handleEndpointFull(rw http.ResponseWriter, r *http.Request) {
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.Header().Set("Access-Control-Allow-Origin", "*")
 
-	lw := NewLoggingResponseWriter(w)
-
-	defer func() {
-		timer.ObserveDuration()
-		apiRequestsTotal.WithLabelValues(r.Method, strconv.Itoa(lw.statusCode)).Inc()
-	}()
-
-	if ipHeader != "" {
-		r.RemoteAddr = r.Header.Get(ipHeader)
-	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	switch r.Method {
-	case "GET":
-		if limit(r.RemoteAddr, getLRUCache, getMut, getLimit, getLimitBurst) {
-			w.WriteHeader(httpStatusEnhanceYourCalm)
-			return
-		}
-		handleGetRequest(w, r)
-	case "POST":
-		if limit(r.RemoteAddr, postLRUCache, postMut, postLimit, postLimitBurst) {
-			w.WriteHeader(httpStatusEnhanceYourCalm)
-			return
-		}
-		handlePostRequest(w, r)
-	default:
-		if debug {
-			log.Println("Unhandled HTTP method", r.Method)
-		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func handleGetRequest(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	mut.RLock()
-	relays := append(permanentRelays, knownRelays...)
+	relays := make([]*relay, len(permanentRelays)+len(knownRelays))
+	n := copy(relays, permanentRelays)
+	copy(relays[n:], knownRelays)
 	mut.RUnlock()
 
-	// Shuffle
-	for i := range relays {
-		j := rand.Intn(i + 1)
-		relays[i], relays[j] = relays[j], relays[i]
-	}
-
-	json.NewEncoder(w).Encode(map[string][]*relay{
+	_ = json.NewEncoder(rw).Encode(map[string][]*relay{
 		"relays": relays,
 	})
 }
 
-func handlePostRequest(w http.ResponseWriter, r *http.Request) {
+// handleEndpointShort returns the relay list with only the URL.
+func handleEndpointShort(rw http.ResponseWriter, r *http.Request) {
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.Header().Set("Access-Control-Allow-Origin", "*")
+
+	mut.RLock()
+	relays := make([]relayShort, 0, len(permanentRelays)+len(knownRelays))
+	for _, r := range append(permanentRelays, knownRelays...) {
+		relays = append(relays, relayShort{URL: slimURL(r.URL)})
+	}
+	mut.RUnlock()
+
+	_ = json.NewEncoder(rw).Encode(map[string][]relayShort{
+		"relays": relays,
+	})
+}
+
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	// Get the IP address of the client
+	rhost := r.RemoteAddr
+	if ipHeader != "" {
+		hdr := r.Header.Get(ipHeader)
+		fields := strings.Split(hdr, ",")
+		if len(fields) > 0 {
+			rhost = strings.TrimSpace(fields[len(fields)-1])
+		}
+	}
+	if host, _, err := net.SplitHostPort(rhost); err == nil {
+		rhost = host
+	}
+
+	// Check the black list. A client is blacklisted if their last 10
+	// attempts to join have all failed. The "Unauthorized" status return
+	// causes strelaysrv to cease attempting to join.
+	if globalBlocklist.IsBlocked(rhost) {
+		log.Println("Rejected blocked client", rhost)
+		http.Error(w, "Too many errors", http.StatusUnauthorized)
+		globalBlocklist.ClearErrors(rhost)
+		return
+	}
+
+	var relayCert *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		relayCert = r.TLS.PeerCertificates[0]
+		log.Printf("Got TLS cert from relay server")
+	}
+
 	var newRelay relay
 	err := json.NewDecoder(r.Body).Decode(&newRelay)
 	r.Body.Close()
@@ -389,7 +374,7 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to parse payload")
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -398,8 +383,23 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to parse URI", newRelay.URL)
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Canonicalize the URL. In particular, parse and re-encode the query
+	// string so that it's guaranteed to be valid.
+	uri.RawQuery = uri.Query().Encode()
+	newRelay.URL = uri.String()
+
+	if relayCert != nil {
+		advertisedId := uri.Query().Get("id")
+		idFromCert := protocol.NewDeviceID(relayCert.Raw).String()
+		if advertisedId != idFromCert {
+			log.Println("Warning: Relay server requested to join with an ID different from the join request, rejecting")
+			http.Error(w, "mismatched advertised id and join request cert", http.StatusBadRequest)
+			return
+		}
 	}
 
 	host, port, err := net.SplitHostPort(uri.Host)
@@ -407,14 +407,8 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Println("Failed to split URI", newRelay.URL)
 		}
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-
-	// Get the IP address of the client
-	rhost := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(rhost); err == nil {
-		rhost = host
 	}
 
 	ip := net.ParseIP(host)
@@ -422,7 +416,7 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 	if ip == nil || ip.IsUnspecified() {
 		uri.Host = net.JoinHostPort(rhost, port)
 		newRelay.URL = uri.String()
-	} else if host != rhost {
+	} else if host != rhost && relayCert == nil {
 		if debug {
 			log.Println("IP address advertised does not match client IP address", r.RemoteAddr, uri)
 		}
@@ -448,10 +442,14 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 	case requests <- request{&newRelay, reschan, prometheus.NewTimer(relayTestActionsSeconds.WithLabelValues("queue"))}:
 		result := <-reschan
 		if result.err != nil {
+			log.Println("Join from", r.RemoteAddr, "failed:", result.err)
+			globalBlocklist.AddError(rhost)
 			relayTestsTotal.WithLabelValues("failed").Inc()
 			http.Error(w, result.err.Error(), http.StatusBadRequest)
 			return
 		}
+		log.Println("Join from", r.RemoteAddr, "succeeded")
+		globalBlocklist.ClearErrors(rhost)
 		relayTestsTotal.WithLabelValues("success").Inc()
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(map[string]time.Duration{
@@ -467,39 +465,39 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func requestProcessor() {
+func requestProcessor(geoip *geoip.Provider) {
 	for request := range requests {
 		if request.queueTimer != nil {
 			request.queueTimer.ObserveDuration()
 		}
 
 		timer := prometheus.NewTimer(relayTestActionsSeconds.WithLabelValues("test"))
-		handleRelayTest(request)
+		handleRelayTest(request, geoip)
 		timer.ObserveDuration()
 	}
 }
 
-func handleRelayTest(request request) {
+func handleRelayTest(request request, geoip *geoip.Provider) {
 	if debug {
 		log.Println("Request for", request.relay)
 	}
-	if !client.TestRelay(request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3) {
+	if err := client.TestRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3); err != nil {
 		if debug {
-			log.Println("Test for relay", request.relay, "failed")
+			log.Println("Test for relay", request.relay, "failed:", err)
 		}
-		request.result <- result{fmt.Errorf("connection test failed"), 0}
+		request.result <- result{err, 0}
 		return
 	}
 
 	stats := fetchStats(request.relay)
-	location := getLocation(request.relay.uri.Host)
+	location := getLocation(request.relay.uri.Host, geoip)
 
 	mut.Lock()
 	if stats != nil {
 		updateMetrics(request.relay.uri.Host, *stats, location)
 	}
 	request.relay.Stats = stats
-	request.relay.StatsRetrieved = time.Now()
+	request.relay.StatsRetrieved = time.Now().Truncate(time.Second)
 	request.relay.Location = location
 
 	timer, ok := evictionTimers[request.relay.uri.Host]
@@ -565,30 +563,8 @@ func evict(relay *relay) func() {
 	}
 }
 
-func limit(addr string, cache *lru.Cache, lock sync.RWMutex, intv time.Duration, burst int) bool {
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		addr = host
-	}
-
-	lock.RLock()
-	bkt, ok := cache.Get(addr)
-	lock.RUnlock()
-	if ok {
-		bkt := bkt.(*rate.Limiter)
-		if !bkt.Allow() {
-			// Rate limit
-			return true
-		}
-	} else {
-		lock.Lock()
-		cache.Add(addr, rate.NewLimiter(rate.Every(intv), burst))
-		lock.Unlock()
-	}
-	return false
-}
-
-func loadRelays(file string) []*relay {
-	content, err := ioutil.ReadFile(file)
+func loadRelays(file string, geoip *geoip.Provider) []*relay {
+	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Println("Failed to load relays: " + err.Error())
 		return nil
@@ -596,7 +572,7 @@ func loadRelays(file string) []*relay {
 
 	var relays []*relay
 	for _, line := range strings.Split(string(content), "\n") {
-		if len(line) == 0 {
+		if line == "" {
 			continue
 		}
 
@@ -611,7 +587,7 @@ func loadRelays(file string) []*relay {
 
 		relays = append(relays, &relay{
 			URL:      line,
-			Location: getLocation(uri.Host),
+			Location: getLocation(uri.Host, geoip),
 			uri:      uri,
 		})
 		if debug {
@@ -626,17 +602,17 @@ func saveRelays(file string, relays []*relay) error {
 	for _, relay := range relays {
 		content += relay.uri.String() + "\n"
 	}
-	return ioutil.WriteFile(file, []byte(content), 0777)
+	return os.WriteFile(file, []byte(content), 0o777)
 }
 
 func createTestCertificate() tls.Certificate {
-	tmpDir, err := ioutil.TempDir("", "relaypoolsrv")
+	tmpDir, err := os.MkdirTemp("", "relaypoolsrv")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	certFile, keyFile := filepath.Join(tmpDir, "cert.pem"), filepath.Join(tmpDir, "key.pem")
-	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv")
+	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv", 20*365)
 	if err != nil {
 		log.Fatalln("Failed to create test X509 key pair:", err)
 	}
@@ -644,21 +620,16 @@ func createTestCertificate() tls.Certificate {
 	return cert
 }
 
-func getLocation(host string) location {
+func getLocation(host string, geoip *geoip.Provider) location {
 	timer := prometheus.NewTimer(locationLookupSeconds)
 	defer timer.ObserveDuration()
-	db, err := geoip2.Open(geoipPath)
-	if err != nil {
-		return location{}
-	}
-	defer db.Close()
 
 	addr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
 		return location{}
 	}
 
-	city, err := db.City(addr.IP)
+	city, err := geoip.City(addr.IP)
 	if err != nil {
 		return location{}
 	}
@@ -684,4 +655,56 @@ func NewLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.statusCode = code
 	lrw.ResponseWriter.WriteHeader(code)
+}
+
+type errorTracker struct {
+	errors *lru.TwoQueueCache[string, *errorCounter]
+}
+
+type errorCounter struct {
+	count atomic.Int32
+}
+
+func newErrorTracker(size int) *errorTracker {
+	cache, err := lru.New2Q[string, *errorCounter](size)
+	if err != nil {
+		panic(err)
+	}
+	return &errorTracker{
+		errors: cache,
+	}
+}
+
+func (b *errorTracker) AddError(host string) {
+	entry, ok := b.errors.Get(host)
+	if !ok {
+		entry = &errorCounter{}
+		b.errors.Add(host, entry)
+	}
+	c := entry.count.Add(1)
+	log.Printf("Error count for %s is now %d", host, c)
+}
+
+func (b *errorTracker) ClearErrors(host string) {
+	b.errors.Remove(host)
+}
+
+func (b *errorTracker) IsBlocked(host string) bool {
+	if be, ok := b.errors.Get(host); ok {
+		return be.count.Load() > 10
+	}
+	return false
+}
+
+func slimURL(u string) string {
+	p, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	newQuery := url.Values{}
+	if id := p.Query().Get("id"); id != "" {
+		newQuery.Set("id", id)
+	}
+	p.RawQuery = newQuery.Encode()
+	return p.String()
 }

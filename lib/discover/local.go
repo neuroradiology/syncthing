@@ -4,14 +4,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate go run ../../script/protofmt.go local.proto
-//go:generate protoc -I ../../vendor/ -I ../../vendor/github.com/gogo/protobuf/protobuf -I . --gogofast_out=. local.proto
-
 package discover
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -22,7 +21,8 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/thejerf/suture"
+	"github.com/syncthing/syncthing/lib/svcutil"
+	"github.com/thejerf/suture/v4"
 )
 
 type localClient struct {
@@ -30,6 +30,7 @@ type localClient struct {
 	myID     protocol.DeviceID
 	addrList AddressLister
 	name     string
+	evLogger events.Logger
 
 	beacon          beacon.Interface
 	localBcastStart time.Time
@@ -46,13 +47,12 @@ const (
 	v13Magic          = uint32(0x7D79BC40) // previous version
 )
 
-func NewLocal(id protocol.DeviceID, addr string, addrList AddressLister) (FinderService, error) {
+func NewLocal(id protocol.DeviceID, addr string, addrList AddressLister, evLogger events.Logger) (FinderService, error) {
 	c := &localClient{
-		Supervisor: suture.New("local", suture.Spec{
-			PassThroughPanics: true,
-		}),
+		Supervisor:      suture.New("local", svcutil.SpecWithDebugLogger(l)),
 		myID:            id,
 		addrList:        addrList,
+		evLogger:        evLogger,
 		localBcastTick:  time.NewTicker(BroadcastInterval).C,
 		forcedBcastTick: make(chan time.Time),
 		localBcastStart: time.Now(),
@@ -64,39 +64,29 @@ func NewLocal(id protocol.DeviceID, addr string, addrList AddressLister) (Finder
 		return nil, err
 	}
 
-	if len(host) == 0 {
+	if host == "" {
 		// A broadcast client
 		c.name = "IPv4 local"
 		bcPort, err := strconv.Atoi(port)
 		if err != nil {
 			return nil, err
 		}
-		c.startLocalIPv4Broadcasts(bcPort)
+		c.beacon = beacon.NewBroadcast(bcPort)
 	} else {
 		// A multicast client
 		c.name = "IPv6 local"
-		c.startLocalIPv6Multicasts(addr)
+		c.beacon = beacon.NewMulticast(addr)
 	}
+	c.Add(c.beacon)
+	c.Add(svcutil.AsService(c.recvAnnouncements, fmt.Sprintf("%s/recv", c)))
 
-	go c.sendLocalAnnouncements()
+	c.Add(svcutil.AsService(c.sendLocalAnnouncements, fmt.Sprintf("%s/sendLocal", c)))
 
 	return c, nil
 }
 
-func (c *localClient) startLocalIPv4Broadcasts(localPort int) {
-	c.beacon = beacon.NewBroadcast(localPort)
-	c.Add(c.beacon)
-	go c.recvAnnouncements(c.beacon)
-}
-
-func (c *localClient) startLocalIPv6Multicasts(localMCAddr string) {
-	c.beacon = beacon.NewMulticast(localMCAddr)
-	c.Add(c.beacon)
-	go c.recvAnnouncements(c.beacon)
-}
-
 // Lookup returns a list of addresses the device is available at.
-func (c *localClient) Lookup(device protocol.DeviceID) (addresses []string, err error) {
+func (c *localClient) Lookup(_ context.Context, device protocol.DeviceID) (addresses []string, err error) {
 	if cache, ok := c.Get(device); ok {
 		if time.Since(cache.when) < CacheLifeTime {
 			addresses = cache.Addresses
@@ -119,17 +109,17 @@ func (c *localClient) Error() error {
 // send.
 func (c *localClient) announcementPkt(instanceID int64, msg []byte) ([]byte, bool) {
 	addrs := c.addrList.AllAddresses()
+
+	// remove all addresses which are not dialable
+	addrs = filterUndialableLocal(addrs)
+
+	// do not leak relay tokens to discovery
+	addrs = sanitizeRelayAddresses(addrs)
+
 	if len(addrs) == 0 {
 		// Nothing to announce
 		return msg, false
 	}
-
-	if cap(msg) >= 4 {
-		msg = msg[:4]
-	} else {
-		msg = make([]byte, 4)
-	}
-	binary.BigEndian.PutUint32(msg, Magic)
 
 	pkt := Announce{
 		ID:         c.myID,
@@ -137,12 +127,18 @@ func (c *localClient) announcementPkt(instanceID int64, msg []byte) ([]byte, boo
 		InstanceID: instanceID,
 	}
 	bs, _ := pkt.Marshal()
+
+	if pktLen := 4 + len(bs); cap(msg) < pktLen {
+		msg = make([]byte, 0, pktLen)
+	}
+	msg = msg[:4]
+	binary.BigEndian.PutUint32(msg, Magic)
 	msg = append(msg, bs...)
 
 	return msg, true
 }
 
-func (c *localClient) sendLocalAnnouncements() {
+func (c *localClient) sendLocalAnnouncements(ctx context.Context) error {
 	var msg []byte
 	var ok bool
 	instanceID := rand.Int63()
@@ -154,16 +150,28 @@ func (c *localClient) sendLocalAnnouncements() {
 		select {
 		case <-c.localBcastTick:
 		case <-c.forcedBcastTick:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-func (c *localClient) recvAnnouncements(b beacon.Interface) {
+func (c *localClient) recvAnnouncements(ctx context.Context) error {
+	b := c.beacon
 	warnedAbout := make(map[string]bool)
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		buf, addr := b.Recv()
+		if addr == nil {
+			continue
+		}
 		if len(buf) < 4 {
-			l.Debugf("discover: short packet from %s")
+			l.Debugf("discover: short packet from %s", addr.String())
 			continue
 		}
 
@@ -255,7 +263,7 @@ func (c *localClient) registerDevice(src net.Addr, device Announce) bool {
 				continue
 			}
 			u.Host = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
-			l.Debugf("discover: Reconstructed URL is %#v", u)
+			l.Debugf("discover: Reconstructed URL is %v", u)
 			validAddresses = append(validAddresses, u.String())
 			l.Debugf("discover: Replaced address %v in %s to get %s", tcpAddr.IP, addr, u.String())
 		} else {
@@ -272,11 +280,65 @@ func (c *localClient) registerDevice(src net.Addr, device Announce) bool {
 	})
 
 	if isNewDevice {
-		events.Default.Log(events.DeviceDiscovered, map[string]interface{}{
+		c.evLogger.Log(events.DeviceDiscovered, map[string]interface{}{
 			"device": device.ID.String(),
 			"addrs":  validAddresses,
 		})
 	}
 
 	return isNewDevice
+}
+
+// filterUndialableLocal returns the list of addresses after removing any
+// localhost, multicast, broadcast or port-zero addresses.
+func filterUndialableLocal(addrs []string) []string {
+	filtered := addrs[:0]
+	for _, addr := range addrs {
+		u, err := url.Parse(addr)
+		if err != nil {
+			continue
+		}
+
+		tcpAddr, err := net.ResolveTCPAddr("tcp", u.Host)
+		if err != nil {
+			continue
+		}
+
+		switch {
+		case len(tcpAddr.IP) == 0:
+		case tcpAddr.Port == 0:
+		case tcpAddr.IP.IsGlobalUnicast(), tcpAddr.IP.IsLinkLocalUnicast(), tcpAddr.IP.IsUnspecified():
+			filtered = append(filtered, addr)
+		}
+	}
+	return filtered
+}
+
+func sanitizeRelayAddresses(addrs []string) []string {
+	filtered := addrs[:0]
+	allowlist := []string{"id"}
+
+	for _, addr := range addrs {
+		u, err := url.Parse(addr)
+		if err != nil {
+			continue
+		}
+
+		if u.Scheme == "relay" {
+			s := url.Values{}
+			q := u.Query()
+
+			for _, w := range allowlist {
+				if q.Has(w) {
+					s.Add(w, q.Get(w))
+				}
+			}
+
+			u.RawQuery = s.Encode()
+			addr = u.String()
+		}
+
+		filtered = append(filtered, addr)
+	}
+	return filtered
 }

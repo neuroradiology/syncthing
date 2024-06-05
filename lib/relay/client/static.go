@@ -3,115 +3,77 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/syncthing/syncthing/lib/osutil"
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 type staticClient struct {
-	uri         *url.URL
-	invitations chan protocol.SessionInvitation
+	commonClient
 
-	closeInvitationsOnFinish bool
+	uri *url.URL
 
 	config *tls.Config
 
 	messageTimeout time.Duration
 	connectTimeout time.Duration
 
-	stop    chan struct{}
-	stopped chan struct{}
-	stopMut sync.RWMutex
-
-	conn *tls.Conn
-
-	mut       sync.RWMutex
-	err       error
-	connected bool
-	latency   time.Duration
+	conn  *tls.Conn
+	token string
 }
 
-func newStaticClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) RelayClient {
-	closeInvitationsOnFinish := false
-	if invitations == nil {
-		closeInvitationsOnFinish = true
-		invitations = make(chan protocol.SessionInvitation)
-	}
-
-	stopped := make(chan struct{})
-	close(stopped) // not yet started, don't block on Stop()
-	return &staticClient{
-		uri:         uri,
-		invitations: invitations,
-
-		closeInvitationsOnFinish: closeInvitationsOnFinish,
+func newStaticClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) *staticClient {
+	c := &staticClient{
+		uri: uri,
 
 		config: configForCerts(certs),
 
 		messageTimeout: time.Minute * 2,
 		connectTimeout: timeout,
 
-		stop:    make(chan struct{}),
-		stopped: stopped,
-		stopMut: sync.NewRWMutex(),
-
-		mut: sync.NewRWMutex(),
+		token: uri.Query().Get("token"),
 	}
+	c.commonClient = newCommonClient(invitations, c.serve, c.String())
+	return c
 }
 
-func (c *staticClient) Serve() {
-	defer c.cleanup()
-	c.stopMut.Lock()
-	c.stop = make(chan struct{})
-	c.stopped = make(chan struct{})
-	c.stopMut.Unlock()
-	defer close(c.stopped)
-
-	if err := c.connect(); err != nil {
-		l.Infof("Could not connect to relay %s: %s", c.uri, err)
-		c.setError(err)
-		return
+func (c *staticClient) serve(ctx context.Context) error {
+	if err := c.connect(ctx); err != nil {
+		l.Debugf("Could not connect to relay %s: %s", c.uri, err)
+		return err
 	}
 
 	l.Debugln(c, "connected", c.conn.RemoteAddr())
+	defer c.disconnect()
 
 	if err := c.join(); err != nil {
-		c.conn.Close()
-		l.Infof("Could not join relay %s: %s", c.uri, err)
-		c.setError(err)
-		return
+		l.Debugf("Could not join relay %s: %s", c.uri, err)
+		return err
 	}
 
 	if err := c.conn.SetDeadline(time.Time{}); err != nil {
-		c.conn.Close()
-		l.Infoln("Relay set deadline:", err)
-		c.setError(err)
-		return
+		l.Debugln("Relay set deadline:", err)
+		return err
 	}
 
 	l.Infof("Joined relay %s://%s", c.uri.Scheme, c.uri.Host)
-	defer l.Infof("Disconnected from relay %s://%s", c.uri.Scheme, c.uri.Host)
-
-	c.mut.Lock()
-	c.connected = true
-	c.mut.Unlock()
 
 	messages := make(chan interface{})
-	errors := make(chan error, 1)
+	errorsc := make(chan error, 1)
 
-	go messageReader(c.conn, messages, errors)
+	go messageReader(ctx, c.conn, messages, errorsc)
 
 	timeout := time.NewTimer(c.messageTimeout)
 
-	c.stopMut.RLock()
-	defer c.stopMut.RUnlock()
 	for {
 		select {
 		case message := <-messages:
@@ -121,80 +83,45 @@ func (c *staticClient) Serve() {
 			switch msg := message.(type) {
 			case protocol.Ping:
 				if err := protocol.WriteMessage(c.conn, protocol.Pong{}); err != nil {
-					l.Infoln("Relay write:", err)
-					c.setError(err)
-					c.disconnect()
-				} else {
-					l.Debugln(c, "sent pong")
+					l.Debugln("Relay write:", err)
+					return err
 				}
+				l.Debugln(c, "sent pong")
 
 			case protocol.SessionInvitation:
 				ip := net.IP(msg.Address)
 				if len(ip) == 0 || ip.IsUnspecified() {
-					msg.Address = remoteIPBytes(c.conn)
+					msg.Address, _ = osutil.IPFromAddr(c.conn.RemoteAddr())
 				}
-				c.invitations <- msg
+				select {
+				case c.invitations <- msg:
+				case <-ctx.Done():
+					l.Debugln(c, "stopping")
+					return ctx.Err()
+				}
 
 			case protocol.RelayFull:
-				l.Infof("Disconnected from relay %s due to it becoming full.", c.uri)
-				c.setError(fmt.Errorf("Relay full"))
-				c.disconnect()
+				l.Debugf("Disconnected from relay %s due to it becoming full.", c.uri)
+				return errors.New("relay full")
 
 			default:
-				l.Infoln("Relay: protocol error: unexpected message %v", msg)
-				c.setError(fmt.Errorf("protocol error: unexpected message %v", msg))
-				c.disconnect()
+				l.Debugln("Relay: protocol error: unexpected message %v", msg)
+				return fmt.Errorf("protocol error: unexpected message %v", msg)
 			}
 
-		case <-c.stop:
+		case <-ctx.Done():
 			l.Debugln(c, "stopping")
-			c.setError(nil)
-			c.disconnect()
+			return ctx.Err()
 
-		// We always exit via this branch of the select, to make sure the
-		// the reader routine exits.
-		case err := <-errors:
-			close(errors)
-			close(messages)
-			c.mut.Lock()
-			if c.connected {
-				c.conn.Close()
-				c.connected = false
-				l.Infof("Disconnecting from relay %s due to error: %s", c.uri, err)
-				c.err = err
-			} else {
-				c.err = nil
-			}
-			c.mut.Unlock()
-			return
+		case err := <-errorsc:
+			l.Debugf("Disconnecting from relay %s due to error: %s", c.uri, err)
+			return err
 
 		case <-timeout.C:
 			l.Debugln(c, "timed out")
-			c.disconnect()
-			c.setError(fmt.Errorf("timed out"))
+			return errors.New("timed out")
 		}
 	}
-}
-
-func (c *staticClient) Stop() {
-	c.stopMut.RLock()
-	close(c.stop)
-	<-c.stopped
-	c.stopMut.RUnlock()
-}
-
-func (c *staticClient) StatusOK() bool {
-	c.mut.RLock()
-	con := c.connected
-	c.mut.RUnlock()
-	return con
-}
-
-func (c *staticClient) Latency() time.Duration {
-	c.mut.RLock()
-	lat := c.latency
-	c.mut.RUnlock()
-	return lat
 }
 
 func (c *staticClient) String() string {
@@ -205,38 +132,29 @@ func (c *staticClient) URI() *url.URL {
 	return c.uri
 }
 
-func (c *staticClient) Invitations() chan protocol.SessionInvitation {
-	c.mut.RLock()
-	inv := c.invitations
-	c.mut.RUnlock()
-	return inv
-}
-
-func (c *staticClient) cleanup() {
-	c.mut.Lock()
-	if c.closeInvitationsOnFinish {
-		close(c.invitations)
-		c.invitations = make(chan protocol.SessionInvitation)
-	}
-	c.mut.Unlock()
-}
-
-func (c *staticClient) connect() error {
+func (c *staticClient) connect(ctx context.Context) error {
 	if c.uri.Scheme != "relay" {
-		return fmt.Errorf("Unsupported relay schema: %v", c.uri.Scheme)
+		return fmt.Errorf("unsupported relay scheme: %v", c.uri.Scheme)
 	}
 
-	t0 := time.Now()
-	tcpConn, err := dialer.DialTimeout("tcp", c.uri.Host, c.connectTimeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, c.connectTimeout)
+	defer cancel()
+	tcpConn, err := dialer.DialContext(timeoutCtx, "tcp", c.uri.Host)
 	if err != nil {
 		return err
 	}
 
-	c.mut.Lock()
-	c.latency = time.Since(t0)
-	c.mut.Unlock()
+	// Copy the TLS config and set the server name we're connecting to. In
+	// many cases this will be an IP address, in which case it's a no-op. In
+	// other cases it will be a hostname, which will cause the TLS stack to
+	// send SNI.
+	cfg := c.config
+	if host, _, err := net.SplitHostPort(c.uri.Host); err == nil {
+		cfg = cfg.Clone()
+		cfg.ServerName = host
+	}
 
-	conn := tls.Client(tcpConn, c.config)
+	conn := tls.Client(tcpConn, cfg)
 
 	if err := conn.SetDeadline(time.Now().Add(c.connectTimeout)); err != nil {
 		conn.Close()
@@ -254,28 +172,11 @@ func (c *staticClient) connect() error {
 
 func (c *staticClient) disconnect() {
 	l.Debugln(c, "disconnecting")
-	c.mut.Lock()
-	c.connected = false
-	c.mut.Unlock()
-
 	c.conn.Close()
 }
 
-func (c *staticClient) setError(err error) {
-	c.mut.Lock()
-	c.err = err
-	c.mut.Unlock()
-}
-
-func (c *staticClient) Error() error {
-	c.mut.RLock()
-	err := c.err
-	c.mut.RUnlock()
-	return err
-}
-
 func (c *staticClient) join() error {
-	if err := protocol.WriteMessage(c.conn, protocol.JoinRelayRequest{}); err != nil {
+	if err := protocol.WriteMessage(c.conn, protocol.JoinRelayRequest{Token: c.token}); err != nil {
 		return err
 	}
 
@@ -287,11 +188,11 @@ func (c *staticClient) join() error {
 	switch msg := message.(type) {
 	case protocol.Response:
 		if msg.Code != 0 {
-			return fmt.Errorf("Incorrect response code %d: %s", msg.Code, msg.Message)
+			return &incorrectResponseCodeErr{msg.Code, msg.Message}
 		}
 
 	case protocol.RelayFull:
-		return fmt.Errorf("relay full")
+		return errors.New("relay full")
 
 	default:
 		return fmt.Errorf("protocol error: expecting response got %v", msg)
@@ -306,8 +207,8 @@ func performHandshakeAndValidation(conn *tls.Conn, uri *url.URL) error {
 	}
 
 	cs := conn.ConnectionState()
-	if !cs.NegotiatedProtocolIsMutual || cs.NegotiatedProtocol != protocol.ProtocolName {
-		return fmt.Errorf("protocol negotiation error")
+	if cs.NegotiatedProtocol != protocol.ProtocolName {
+		return errors.New("protocol negotiation error")
 	}
 
 	q := uri.Query()
@@ -315,7 +216,7 @@ func performHandshakeAndValidation(conn *tls.Conn, uri *url.URL) error {
 	if relayIDs != "" {
 		relayID, err := syncthingprotocol.DeviceIDFromString(relayIDs)
 		if err != nil {
-			return fmt.Errorf("relay address contains invalid verification id: %s", err)
+			return fmt.Errorf("relay address contains invalid verification id: %w", err)
 		}
 
 		certs := cs.PeerCertificates
@@ -332,13 +233,17 @@ func performHandshakeAndValidation(conn *tls.Conn, uri *url.URL) error {
 	return nil
 }
 
-func messageReader(conn net.Conn, messages chan<- interface{}, errors chan<- error) {
+func messageReader(ctx context.Context, conn net.Conn, messages chan<- interface{}, errors chan<- error) {
 	for {
 		msg, err := protocol.ReadMessage(conn)
 		if err != nil {
 			errors <- err
 			return
 		}
-		messages <- msg
+		select {
+		case messages <- msg:
+		case <-ctx.Done():
+			return
+		}
 	}
 }

@@ -1,6 +1,6 @@
 // Copyright (C) 2015 Audrius Butkevicius and Contributors (see the CONTRIBUTORS file).
 
-//go:generate -command genxdr go run ../../../vendor/github.com/calmh/xdr/cmd/genxdr/main.go
+//go:generate -command genxdr go run github.com/calmh/xdr/cmd/genxdr
 //go:generate genxdr -o packets_xdr.go packets.go
 
 package protocol
@@ -31,8 +31,11 @@ type header struct {
 
 type Ping struct{}
 type Pong struct{}
-type JoinRelayRequest struct{}
 type RelayFull struct{}
+
+type JoinRelayRequest struct {
+	Token string
+}
 
 type JoinSessionRequest struct {
 	Key []byte // max:32
@@ -56,13 +59,13 @@ type SessionInvitation struct {
 }
 
 func (i SessionInvitation) String() string {
-	return fmt.Sprintf("%s@%s", syncthingprotocol.DeviceIDFromBytes(i.From), i.AddressString())
+	device := "<invalid>"
+	if address, err := syncthingprotocol.DeviceIDFromBytes(i.From); err == nil {
+		device = address.String()
+	}
+	return fmt.Sprintf("%s@%s:%d", device, net.IP(i.Address), i.Port)
 }
 
 func (i SessionInvitation) GoString() string {
 	return i.String()
-}
-
-func (i SessionInvitation) AddressString() string {
-	return fmt.Sprintf("%s:%d", net.IP(i.Address), i.Port)
 }

@@ -10,9 +10,9 @@ import (
 	"bytes"
 	"context"
 	"hash"
+	"hash/adler32"
 	"io"
 
-	"github.com/chmduquesne/rollinghash/adler32"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sha256"
 )
@@ -30,7 +30,7 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	}
 
 	hf := sha256.New()
-	hashLength := hf.Size()
+	const hashLength = sha256.Size
 
 	var weakHf hash.Hash32 = noopHash{}
 	var multiHf io.Writer = hf
@@ -48,7 +48,11 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 		// Allocate contiguous blocks for the BlockInfo structures and their
 		// hashes once and for all, and stick to the specified size.
 		r = io.LimitReader(r, sizehint)
-		numBlocks := int(sizehint / int64(blocksize))
+		numBlocks := sizehint / int64(blocksize)
+		remainder := sizehint % int64(blocksize)
+		if remainder != 0 {
+			numBlocks++
+		}
 		blocks = make([]protocol.BlockInfo, 0, numBlocks)
 		hashes = make([]byte, 0, hashLength*numBlocks)
 	}
@@ -83,7 +87,7 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 		thisHash, hashes = hashes[:hashLength], hashes[hashLength:]
 
 		b := protocol.BlockInfo{
-			Size:     int32(n),
+			Size:     int(n),
 			Offset:   offset,
 			Hash:     thisHash,
 			WeakHash: weakHf.Sum32(),
@@ -108,26 +112,19 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	return blocks, nil
 }
 
+// Validate quickly validates buf against the 32-bit weakHash, if not zero,
+// else against the cryptohash hash, if len(hash)>0. It is satisfied if
+// either hash matches or neither hash is given.
 func Validate(buf, hash []byte, weakHash uint32) bool {
-	rd := bytes.NewReader(buf)
-	if weakHash != 0 {
-		whf := adler32.New()
-		if _, err := io.Copy(whf, rd); err == nil && whf.Sum32() == weakHash {
-			return true
-		}
-		// Copy error or mismatch, go to next algo.
-		rd.Seek(0, io.SeekStart)
+	if weakHash != 0 && adler32.Checksum(buf) == weakHash {
+		return true
 	}
 
 	if len(hash) > 0 {
-		hf := sha256.New()
-		if _, err := io.Copy(hf, rd); err == nil {
-			// Sum allocates, so let's hope we don't hit this often.
-			return bytes.Equal(hf.Sum(nil), hash)
-		}
+		hbuf := sha256.Sum256(buf)
+		return bytes.Equal(hbuf[:], hash)
 	}
 
-	// Both algos failed or no hashes were specified. Assume it's all good.
 	return true
 }
 
@@ -142,4 +139,4 @@ func (noopHash) Write([]byte) (int, error) { return 0, nil }
 
 type noopCounter struct{}
 
-func (c *noopCounter) Update(bytes int64) {}
+func (*noopCounter) Update(_ int64) {}

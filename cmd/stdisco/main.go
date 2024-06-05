@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/beacon"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -47,14 +49,16 @@ func main() {
 		log.Println("My ID:", myID)
 	}
 
-	runbeacon(beacon.NewMulticast(mc), fake)
-	runbeacon(beacon.NewBroadcast(bc), fake)
+	ctx := context.Background()
+
+	runbeacon(ctx, beacon.NewMulticast(mc), fake)
+	runbeacon(ctx, beacon.NewBroadcast(bc), fake)
 
 	select {}
 }
 
-func runbeacon(bc beacon.Interface, fake bool) {
-	go bc.Serve()
+func runbeacon(ctx context.Context, bc beacon.Interface, fake bool) {
+	go bc.Serve(ctx)
 	go recv(bc)
 	if fake {
 		go send(bc)

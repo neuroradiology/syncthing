@@ -10,14 +10,14 @@ func TestWinsConflict(t *testing.T) {
 		{{ModifiedS: 42}, {ModifiedS: 41}},
 		{{ModifiedS: 41}, {ModifiedS: 42, Deleted: true}},
 		{{Deleted: true}, {ModifiedS: 10, RawInvalid: true}},
-		{{ModifiedS: 41, Version: Vector{[]Counter{{42, 2}, {43, 1}}}}, {ModifiedS: 41, Version: Vector{[]Counter{{42, 1}, {43, 2}}}}},
+		{{ModifiedS: 41, Version: Vector{Counters: []Counter{{ID: 42, Value: 2}, {ID: 43, Value: 1}}}}, {ModifiedS: 41, Version: Vector{Counters: []Counter{{ID: 42, Value: 1}, {ID: 43, Value: 2}}}}},
 	}
 
 	for _, tc := range testcases {
-		if !tc[0].WinsConflict(tc[1]) {
+		if !WinsConflict(tc[0], tc[1]) {
 			t.Errorf("%v should win over %v", tc[0], tc[1])
 		}
-		if tc[1].WinsConflict(tc[0]) {
+		if WinsConflict(tc[1], tc[0]) {
 			t.Errorf("%v should not win over %v", tc[1], tc[0])
 		}
 	}

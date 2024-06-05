@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 func TestIsLANHost(t *testing.T) {
@@ -35,8 +37,8 @@ func TestIsLANHost(t *testing.T) {
 		Options: config.OptionsConfiguration{
 			AlwaysLocalNets: []string{"10.20.30.0/24"},
 		},
-	})
-	s := &Service{cfg: cfg}
+	}, protocol.LocalDeviceID, events.NoopLogger)
+	s := &lanChecker{cfg: cfg}
 
 	for _, tc := range cases {
 		res := s.isLANHost(tc.addr)

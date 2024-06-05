@@ -7,6 +7,7 @@
 package connections
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/url"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
@@ -26,74 +29,95 @@ func init() {
 }
 
 type tcpListener struct {
+	svcutil.ServiceWithError
 	onAddressesChangedNotifier
 
-	uri     *url.URL
-	cfg     *config.Wrapper
-	tlsCfg  *tls.Config
-	stop    chan struct{}
-	conns   chan internalConn
-	factory listenerFactory
+	uri        *url.URL
+	cfg        config.Wrapper
+	tlsCfg     *tls.Config
+	conns      chan internalConn
+	factory    listenerFactory
+	registry   *registry.Registry
+	lanChecker *lanChecker
 
 	natService *nat.Service
 	mapping    *nat.Mapping
+	laddr      net.Addr
 
-	err error
 	mut sync.RWMutex
 }
 
-func (t *tcpListener) Serve() {
-	t.mut.Lock()
-	t.err = nil
-	t.mut.Unlock()
-
+func (t *tcpListener) serve(ctx context.Context) error {
 	tcaddr, err := net.ResolveTCPAddr(t.uri.Scheme, t.uri.Host)
 	if err != nil {
-		t.mut.Lock()
-		t.err = err
-		t.mut.Unlock()
 		l.Infoln("Listen (BEP/tcp):", err)
-		return
+		return err
 	}
 
-	listener, err := net.ListenTCP(t.uri.Scheme, tcaddr)
+	lc := net.ListenConfig{
+		Control: dialer.ReusePortControl,
+	}
+
+	listener, err := lc.Listen(context.TODO(), t.uri.Scheme, tcaddr.String())
 	if err != nil {
-		t.mut.Lock()
-		t.err = err
-		t.mut.Unlock()
 		l.Infoln("Listen (BEP/tcp):", err)
-		return
+		return err
 	}
 	defer listener.Close()
 
-	l.Infof("TCP listener (%v) starting", listener.Addr())
-	defer l.Infof("TCP listener (%v) shutting down", listener.Addr())
+	// We might bind to :0, so use the port we've been given.
+	tcaddr = listener.Addr().(*net.TCPAddr)
 
-	mapping := t.natService.NewMapping(nat.TCP, tcaddr.IP, tcaddr.Port)
-	mapping.OnChanged(func(_ *nat.Mapping, _, _ []nat.Address) {
+	t.notifyAddressesChanged(t)
+	defer t.clearAddresses(t)
+
+	t.registry.Register(t.uri.Scheme, tcaddr)
+	defer t.registry.Unregister(t.uri.Scheme, tcaddr)
+
+	l.Infof("TCP listener (%v) starting", tcaddr)
+	defer l.Infof("TCP listener (%v) shutting down", tcaddr)
+
+	var ipVersion nat.IPVersion
+	if t.uri.Scheme == "tcp4" {
+		ipVersion = nat.IPv4Only
+	} else if t.uri.Scheme == "tcp6" {
+		ipVersion = nat.IPv6Only
+	} else {
+		ipVersion = nat.IPvAny
+	}
+	mapping := t.natService.NewMapping(nat.TCP, ipVersion, tcaddr.IP, tcaddr.Port)
+	mapping.OnChanged(func() {
 		t.notifyAddressesChanged(t)
 	})
+	// Should be called after t.mapping is nil'ed out.
 	defer t.natService.RemoveMapping(mapping)
 
 	t.mut.Lock()
 	t.mapping = mapping
+	t.laddr = tcaddr
 	t.mut.Unlock()
+	defer func() {
+		t.mut.Lock()
+		t.mapping = nil
+		t.laddr = nil
+		t.mut.Unlock()
+	}()
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
 
+	// :(, but what can you do.
+	tcpListener := listener.(*net.TCPListener)
+
 	for {
-		listener.SetDeadline(time.Now().Add(time.Second))
-		conn, err := listener.Accept()
+		_ = tcpListener.SetDeadline(time.Now().Add(time.Second))
+		conn, err := tcpListener.Accept()
 		select {
-		case <-t.stop:
+		case <-ctx.Done():
 			if err == nil {
 				conn.Close()
 			}
-			t.mut.Lock()
-			t.mapping = nil
-			t.mut.Unlock()
-			return
+			return nil
 		default:
 		}
 		if err != nil {
@@ -104,7 +128,7 @@ func (t *tcpListener) Serve() {
 				if acceptFailures > maxAcceptFailures {
 					// Return to restart the listener, because something
 					// seems permanently damaged.
-					return
+					return err
 				}
 
 				// Slightly increased delay for each failure.
@@ -133,12 +157,13 @@ func (t *tcpListener) Serve() {
 			continue
 		}
 
-		t.conns <- internalConn{tc, connTypeTCPServer, tcpPriority}
+		priority := t.cfg.Options().ConnectionPriorityTCPWAN
+		isLocal := t.lanChecker.isLAN(conn.RemoteAddr())
+		if isLocal {
+			priority = t.cfg.Options().ConnectionPriorityTCPLAN
+		}
+		t.conns <- newInternalConn(tc, connTypeTCPServer, isLocal, priority)
 	}
-}
-
-func (t *tcpListener) Stop() {
-	close(t.stop)
 }
 
 func (t *tcpListener) URI() *url.URL {
@@ -146,8 +171,10 @@ func (t *tcpListener) URI() *url.URL {
 }
 
 func (t *tcpListener) WANAddresses() []*url.URL {
-	uris := t.LANAddresses()
 	t.mut.RLock()
+	uris := []*url.URL{
+		maybeReplacePort(t.uri, t.laddr),
+	}
 	if t.mapping != nil {
 		addrs := t.mapping.ExternalAddresses()
 		for _, addr := range addrs {
@@ -159,26 +186,32 @@ func (t *tcpListener) WANAddresses() []*url.URL {
 			// For every address with a specified IP, add one without an IP,
 			// just in case the specified IP is still internal (router behind DMZ).
 			if len(addr.IP) != 0 && !addr.IP.IsUnspecified() {
-				uri = *t.uri
+				zeroUri := *t.uri
 				addr.IP = nil
-				uri.Host = addr.String()
-				uris = append(uris, &uri)
+				zeroUri.Host = addr.String()
+				uris = append(uris, &zeroUri)
 			}
 		}
 	}
 	t.mut.RUnlock()
+
+	// If we support ReusePort, add an unspecified zero port address, which will be resolved by the discovery server
+	// in hopes that TCP punch through works.
+	if dialer.SupportsReusePort {
+		uri := *t.uri
+		uri.Host = "0.0.0.0:0"
+		uris = append([]*url.URL{&uri}, uris...)
+	}
 	return uris
 }
 
 func (t *tcpListener) LANAddresses() []*url.URL {
-	return []*url.URL{t.uri}
-}
-
-func (t *tcpListener) Error() error {
 	t.mut.RLock()
-	err := t.err
+	uri := maybeReplacePort(t.uri, t.laddr)
 	t.mut.RUnlock()
-	return err
+	addrs := []*url.URL{uri}
+	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(uri.Scheme, uri)...)
+	return addrs
 }
 
 func (t *tcpListener) String() string {
@@ -189,22 +222,25 @@ func (t *tcpListener) Factory() listenerFactory {
 	return t.factory
 }
 
-func (t *tcpListener) NATType() string {
+func (*tcpListener) NATType() string {
 	return "unknown"
 }
 
 type tcpListenerFactory struct{}
 
-func (f *tcpListenerFactory) New(uri *url.URL, cfg *config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
-	return &tcpListener{
+func (f *tcpListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service, registry *registry.Registry, lanChecker *lanChecker) genericListener {
+	l := &tcpListener{
 		uri:        fixupPort(uri, config.DefaultTCPPort),
 		cfg:        cfg,
 		tlsCfg:     tlsCfg,
 		conns:      conns,
 		natService: natService,
-		stop:       make(chan struct{}),
 		factory:    f,
+		registry:   registry,
+		lanChecker: lanChecker,
 	}
+	l.ServiceWithError = svcutil.AsService(l.serve, l.String())
+	return l
 }
 
 func (tcpListenerFactory) Valid(_ config.Configuration) error {

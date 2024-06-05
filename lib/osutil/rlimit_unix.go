@@ -4,11 +4,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build !windows
 // +build !windows
 
 package osutil
 
-import "syscall"
+import (
+	"syscall"
+
+	"github.com/syncthing/syncthing/lib/build"
+)
+
+const (
+	darwinOpenMax = 10240
+)
 
 // MaximizeOpenFileLimit tries to set the resource limit RLIMIT_NOFILE (number
 // of open file descriptors) to the max (hard limit), if the current (soft
@@ -24,6 +33,12 @@ func MaximizeOpenFileLimit() (int, error) {
 	// If we're already at max, there's no need to try to raise the limit.
 	if lim.Cur >= lim.Max {
 		return int(lim.Cur), nil
+	}
+
+	// macOS doesn't like a soft limit greater then OPEN_MAX
+	// See also: man setrlimit
+	if build.IsDarwin && lim.Max > darwinOpenMax {
+		lim.Max = darwinOpenMax
 	}
 
 	// Try to increase the limit to the max.

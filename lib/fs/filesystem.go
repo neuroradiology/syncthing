@@ -10,15 +10,38 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/ignore/ignoreresult"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
+
+type filesystemWrapperType int32
+
+const (
+	filesystemWrapperTypeNone filesystemWrapperType = iota
+	filesystemWrapperTypeMtime
+	filesystemWrapperTypeCase
+	filesystemWrapperTypeError
+	filesystemWrapperTypeWalk
+	filesystemWrapperTypeLog
+	filesystemWrapperTypeMetrics
+)
+
+type XattrFilter interface {
+	Permit(string) bool
+	GetMaxSingleEntrySize() int
+	GetMaxTotalSize() int
+}
 
 // The Filesystem interface abstracts access to the file system.
 type Filesystem interface {
 	Chmod(name string, mode FileMode) error
+	Lchown(name string, uid, gid string) error // uid/gid as strings; numeric on POSIX, SID on Windows, like in os/user package
 	Chtimes(name string, atime time.Time, mtime time.Time) error
 	Create(name string) (File, error)
 	CreateSymlink(target, name string) error
@@ -35,7 +58,10 @@ type Filesystem interface {
 	Stat(name string) (FileInfo, error)
 	SymlinksSupported() bool
 	Walk(name string, walkFn WalkFunc) error
-	Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error)
+	// If setup fails, returns non-nil error, and if afterwards a fatal (!)
+	// error occurs, sends that error on the channel. Afterwards this watch
+	// can be considered stopped.
+	Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, <-chan error, error)
 	Hide(name string) error
 	Unhide(name string) error
 	Glob(pattern string) ([]string, error)
@@ -43,7 +69,15 @@ type Filesystem interface {
 	Usage(name string) (Usage, error)
 	Type() FilesystemType
 	URI() string
+	Options() []Option
 	SameFile(fi1, fi2 FileInfo) bool
+	PlatformData(name string, withOwnership, withXattrs bool, xattrFilter XattrFilter) (protocol.PlatformData, error)
+	GetXattr(name string, xattrFilter XattrFilter) ([]protocol.Xattr, error)
+	SetXattr(path string, xattrs []protocol.Xattr, xattrFilter XattrFilter) error
+
+	// Used for unwrapping things
+	underlying() (Filesystem, bool)
+	wrapperType() filesystemWrapperType
 }
 
 // The File interface abstracts access to a regular file, being a somewhat
@@ -71,9 +105,13 @@ type FileInfo interface {
 	Size() int64
 	ModTime() time.Time
 	IsDir() bool
+	Sys() interface{}
 	// Extensions
 	IsRegular() bool
 	IsSymlink() bool
+	Owner() int
+	Group() int
+	InodeChangeTime() time.Time // may be zero if not supported
 }
 
 // FileMode is similar to os.FileMode
@@ -85,17 +123,12 @@ func (fm FileMode) String() string {
 
 // Usage represents filesystem space usage
 type Usage struct {
-	Free  int64
-	Total int64
+	Free  uint64
+	Total uint64
 }
 
 type Matcher interface {
-	ShouldIgnore(name string) bool
-	SkipIgnoredDirs() bool
-}
-
-type MatchResult interface {
-	IsIgnored() bool
+	Match(name string) ignoreresult.R
 }
 
 type Event struct {
@@ -129,50 +162,96 @@ func (evType EventType) String() string {
 	}
 }
 
-var ErrWatchNotSupported = errors.New("watching is not supported")
+var (
+	ErrWatchNotSupported  = errors.New("watching is not supported")
+	ErrXattrsNotSupported = errors.New("extended attributes are not supported on this platform")
+)
 
 // Equivalents from os package.
 
-const ModePerm = FileMode(os.ModePerm)
-const ModeSetgid = FileMode(os.ModeSetgid)
-const ModeSetuid = FileMode(os.ModeSetuid)
-const ModeSticky = FileMode(os.ModeSticky)
-const ModeSymlink = FileMode(os.ModeSymlink)
-const ModeType = FileMode(os.ModeType)
-const PathSeparator = os.PathSeparator
-const OptAppend = os.O_APPEND
-const OptCreate = os.O_CREATE
-const OptExclusive = os.O_EXCL
-const OptReadOnly = os.O_RDONLY
-const OptReadWrite = os.O_RDWR
-const OptSync = os.O_SYNC
-const OptTruncate = os.O_TRUNC
-const OptWriteOnly = os.O_WRONLY
+const (
+	ModePerm      = FileMode(os.ModePerm)
+	ModeSetgid    = FileMode(os.ModeSetgid)
+	ModeSetuid    = FileMode(os.ModeSetuid)
+	ModeSticky    = FileMode(os.ModeSticky)
+	ModeSymlink   = FileMode(os.ModeSymlink)
+	ModeType      = FileMode(os.ModeType)
+	PathSeparator = os.PathSeparator
+	OptAppend     = os.O_APPEND
+	OptCreate     = os.O_CREATE
+	OptExclusive  = os.O_EXCL
+	OptReadOnly   = os.O_RDONLY
+	OptReadWrite  = os.O_RDWR
+	OptSync       = os.O_SYNC
+	OptTruncate   = os.O_TRUNC
+	OptWriteOnly  = os.O_WRONLY
+)
 
 // SkipDir is used as a return value from WalkFuncs to indicate that
 // the directory named in the call is to be skipped. It is not returned
 // as an error by any function.
 var SkipDir = filepath.SkipDir
 
-// IsExist is the equivalent of os.IsExist
-var IsExist = os.IsExist
+func IsExist(err error) bool {
+	return errors.Is(err, ErrExist)
+}
+
+// ErrExist is the equivalent of os.ErrExist
+var ErrExist = fs.ErrExist
 
 // IsNotExist is the equivalent of os.IsNotExist
-var IsNotExist = os.IsNotExist
+func IsNotExist(err error) bool {
+	return errors.Is(err, ErrNotExist)
+}
+
+// ErrNotExist is the equivalent of os.ErrNotExist
+var ErrNotExist = fs.ErrNotExist
 
 // IsPermission is the equivalent of os.IsPermission
-var IsPermission = os.IsPermission
+func IsPermission(err error) bool {
+	return errors.Is(err, fs.ErrPermission)
+}
 
 // IsPathSeparator is the equivalent of os.IsPathSeparator
 var IsPathSeparator = os.IsPathSeparator
 
-func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
+// Option modifies a filesystem at creation. An option might be specific
+// to a filesystem-type.
+//
+// String is used to detect options with the same effect, i.e. must be different
+// for options with different effects. Meaning if an option has parameters, a
+// representation of those must be part of the returned string.
+type Option interface {
+	String() string
+	apply(Filesystem) Filesystem
+}
+
+func NewFilesystem(fsType FilesystemType, uri string, opts ...Option) Filesystem {
+	var caseOpt Option
+	var mtimeOpt Option
+	i := 0
+	for _, opt := range opts {
+		if caseOpt != nil && mtimeOpt != nil {
+			break
+		}
+		switch opt.(type) {
+		case *OptionDetectCaseConflicts:
+			caseOpt = opt
+		case *optionMtime:
+			mtimeOpt = opt
+		default:
+			opts[i] = opt
+			i++
+		}
+	}
+	opts = opts[:i]
+
 	var fs Filesystem
 	switch fsType {
 	case FilesystemTypeBasic:
-		fs = newBasicFilesystem(uri)
+		fs = newBasicFilesystem(uri, opts...)
 	case FilesystemTypeFake:
-		fs = newFakeFilesystem(uri)
+		fs = newFakeFilesystem(uri, opts...)
 	default:
 		l.Debugln("Unknown filesystem", fsType, uri)
 		fs = &errorFilesystem{
@@ -181,6 +260,19 @@ func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
 			err:    errors.New("filesystem with type " + fsType.String() + " does not exist."),
 		}
 	}
+
+	// Case handling is the innermost, as any filesystem calls by wrappers should be case-resolved
+	if caseOpt != nil {
+		fs = caseOpt.apply(fs)
+	}
+
+	// mtime handling should happen inside walking, as filesystem calls while
+	// walking should be mtime-resolved too
+	if mtimeOpt != nil {
+		fs = mtimeOpt.apply(fs)
+	}
+
+	fs = &metricsFS{next: fs}
 
 	if l.ShouldDebug("walkfs") {
 		return NewWalkFilesystem(&logFilesystem{fs})
@@ -197,7 +289,8 @@ func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
 // root, represents an internal file that should always be ignored. The file
 // path must be clean (i.e., in canonical shortest form).
 func IsInternal(file string) bool {
-	// fs cannot import config, so we hard code .stfolder here (config.DefaultMarkerName)
+	// fs cannot import config or versioner, so we hard code .stfolder
+	// (config.DefaultMarkerName) and .stversions (versioner.DefaultPath)
 	internals := []string{".stfolder", ".stignore", ".stversions"}
 	for _, internal := range internals {
 		if file == internal {
@@ -210,17 +303,22 @@ func IsInternal(file string) bool {
 	return false
 }
 
+var (
+	errPathInvalid           = errors.New("path is invalid")
+	errPathTraversingUpwards = errors.New("relative path traversing upwards (starting with ..)")
+)
+
 // Canonicalize checks that the file path is valid and returns it in the "canonical" form:
 // - /foo/bar -> foo/bar
 // - / -> "."
 func Canonicalize(file string) (string, error) {
-	pathSep := string(PathSeparator)
+	const pathSep = string(PathSeparator)
 
 	if strings.HasPrefix(file, pathSep+pathSep) {
 		// The relative path may pretend to be an absolute path within
 		// the root, but the double path separator on Windows implies
 		// something else and is out of spec.
-		return "", ErrNotRelative
+		return "", errPathInvalid
 	}
 
 	// The relative path should be clean from internal dotdots and similar
@@ -228,12 +326,11 @@ func Canonicalize(file string) (string, error) {
 	file = filepath.Clean(file)
 
 	// It is not acceptable to attempt to traverse upwards.
-	switch file {
-	case "..":
-		return "", ErrNotRelative
+	if file == ".." {
+		return "", errPathTraversingUpwards
 	}
 	if strings.HasPrefix(file, ".."+pathSep) {
-		return "", ErrNotRelative
+		return "", errPathTraversingUpwards
 	}
 
 	if strings.HasPrefix(file, pathSep) {
@@ -244,4 +341,35 @@ func Canonicalize(file string) (string, error) {
 	}
 
 	return file, nil
+}
+
+// unwrapFilesystem removes "wrapping" filesystems to expose the filesystem of the requested wrapperType, if it exists.
+func unwrapFilesystem(fs Filesystem, wrapperType filesystemWrapperType) (Filesystem, bool) {
+	var ok bool
+	for {
+		if fs.wrapperType() == wrapperType {
+			return fs, true
+		}
+		fs, ok = fs.underlying()
+		if !ok {
+			return nil, false
+		}
+	}
+}
+
+// WriteFile writes data to the named file, creating it if necessary.
+// If the file does not exist, WriteFile creates it with permissions perm (before umask);
+// otherwise WriteFile truncates it before writing, without changing permissions.
+// Since Writefile requires multiple system calls to complete, a failure mid-operation
+// can leave the file in a partially written state.
+func WriteFile(fs Filesystem, name string, data []byte, perm FileMode) error {
+	f, err := fs.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
 }

@@ -128,10 +128,10 @@ func (fs *logFilesystem) Walk(root string, walkFn WalkFunc) error {
 	return err
 }
 
-func (fs *logFilesystem) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
-	evChan, err := fs.Filesystem.Watch(path, ignore, ctx, ignorePerms)
+func (fs *logFilesystem) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, <-chan error, error) {
+	evChan, errChan, err := fs.Filesystem.Watch(path, ignore, ctx, ignorePerms)
 	l.Debugln(getCaller(), fs.Type(), fs.URI(), "Watch", path, ignore, ignorePerms, err)
-	return evChan, err
+	return evChan, errChan, err
 }
 
 func (fs *logFilesystem) Unhide(name string) error {
@@ -162,4 +162,12 @@ func (fs *logFilesystem) Usage(name string) (Usage, error) {
 	usage, err := fs.Filesystem.Usage(name)
 	l.Debugln(getCaller(), fs.Type(), fs.URI(), "Usage", name, usage, err)
 	return usage, err
+}
+
+func (fs *logFilesystem) underlying() (Filesystem, bool) {
+	return fs.Filesystem, true
+}
+
+func (*logFilesystem) wrapperType() filesystemWrapperType {
+	return filesystemWrapperTypeLog
 }

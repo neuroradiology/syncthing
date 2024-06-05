@@ -104,18 +104,32 @@ type aggregator struct {
 	notifyTimer           *time.Timer
 	notifyTimerNeedsReset bool
 	notifyTimerResetChan  chan time.Duration
-	counts                map[fs.EventType]int
+	counts                eventCounter
 	root                  *eventDir
 	ctx                   context.Context
 }
 
-func newAggregator(folderCfg config.FolderConfiguration, ctx context.Context) *aggregator {
+type eventCounter struct {
+	removes    int // Includes mixed events.
+	nonRemoves int
+}
+
+func (c *eventCounter) add(typ fs.EventType, n int) {
+	if typ&fs.Remove != 0 {
+		c.removes += n
+	} else {
+		c.nonRemoves += n
+	}
+}
+
+func (c *eventCounter) total() int { return c.removes + c.nonRemoves }
+
+func newAggregator(ctx context.Context, folderCfg config.FolderConfiguration) *aggregator {
 	a := &aggregator{
 		folderID:              folderCfg.ID,
 		folderCfgUpdate:       make(chan config.FolderConfiguration),
 		notifyTimerNeedsReset: false,
 		notifyTimerResetChan:  make(chan time.Duration),
-		counts:                make(map[fs.EventType]int),
 		root:                  newEventDir(),
 		ctx:                   ctx,
 	}
@@ -125,28 +139,33 @@ func newAggregator(folderCfg config.FolderConfiguration, ctx context.Context) *a
 	return a
 }
 
-func Aggregate(in <-chan fs.Event, out chan<- []string, folderCfg config.FolderConfiguration, cfg *config.Wrapper, ctx context.Context) {
-	a := newAggregator(folderCfg, ctx)
+func Aggregate(ctx context.Context, in <-chan fs.Event, out chan<- []string, folderCfg config.FolderConfiguration, cfg config.Wrapper, evLogger events.Logger) {
+	a := newAggregator(ctx, folderCfg)
 
 	// Necessary for unit tests where the backend is mocked
-	go a.mainLoop(in, out, cfg)
+	go a.mainLoop(in, out, cfg, evLogger)
 }
 
-func (a *aggregator) mainLoop(in <-chan fs.Event, out chan<- []string, cfg *config.Wrapper) {
+func (a *aggregator) mainLoop(in <-chan fs.Event, out chan<- []string, cfg config.Wrapper, evLogger events.Logger) {
 	a.notifyTimer = time.NewTimer(a.notifyDelay)
 	defer a.notifyTimer.Stop()
 
-	inProgress := make(map[string]struct{})
-	inProgressItemSubscription := events.Default.Subscribe(events.ItemStarted | events.ItemFinished)
+	inProgressItemSubscription := evLogger.Subscribe(events.ItemStarted | events.ItemFinished)
+	defer inProgressItemSubscription.Unsubscribe()
 
 	cfg.Subscribe(a)
+	defer cfg.Unsubscribe(a)
+
+	inProgress := make(map[string]struct{})
 
 	for {
 		select {
 		case event := <-in:
 			a.newEvent(event, inProgress)
-		case event := <-inProgressItemSubscription.C():
-			updateInProgressSet(event, inProgress)
+		case event, ok := <-inProgressItemSubscription.C():
+			if ok {
+				updateInProgressSet(event, inProgress)
+			}
 		case <-a.notifyTimer.C:
 			a.actOnTimer(out)
 		case interval := <-a.notifyTimerResetChan:
@@ -154,7 +173,6 @@ func (a *aggregator) mainLoop(in <-chan fs.Event, out chan<- []string, cfg *conf
 		case folderCfg := <-a.folderCfgUpdate:
 			a.updateConfig(folderCfg)
 		case <-a.ctx.Done():
-			cfg.Unsubscribe(a)
 			l.Debugln(a, "Stopped")
 			return
 		}
@@ -174,7 +192,7 @@ func (a *aggregator) newEvent(event fs.Event, inProgress map[string]struct{}) {
 }
 
 func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
-	if event.Name == "." || a.eventCount() == maxFiles {
+	if event.Name == "." || a.counts.total() == maxFiles {
 		l.Debugln(a, "Scan entire folder")
 		firstModTime := evTime
 		if a.root.childCount() != 0 {
@@ -188,8 +206,8 @@ func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
 			lastModTime:  evTime,
 			evType:       event.Type,
 		}
-		a.counts = make(map[fs.EventType]int)
-		a.counts[event.Type]++
+		a.counts = eventCounter{}
+		a.counts.add(event.Type, 1)
 		a.resetNotifyTimerIfNeeded()
 		return
 	}
@@ -210,9 +228,9 @@ func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
 		if ev, ok := parentDir.events[name]; ok {
 			ev.lastModTime = evTime
 			if merged := event.Type.Merge(ev.evType); ev.evType != merged {
-				a.counts[ev.evType]--
+				a.counts.add(ev.evType, -1)
+				a.counts.add(merged, 1)
 				ev.evType = merged
-				a.counts[ev.evType]++
 			}
 			l.Debugf("%v Parent %s (type %s) already tracked: %s", a, currPath, ev.evType, event.Name)
 			return
@@ -247,9 +265,9 @@ func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
 	if ev, ok := parentDir.events[name]; ok {
 		ev.lastModTime = evTime
 		if merged := event.Type.Merge(ev.evType); ev.evType != merged {
-			a.counts[ev.evType]--
+			a.counts.add(ev.evType, -1)
+			a.counts.add(merged, 1)
 			ev.evType = merged
-			a.counts[ev.evType]++
 		}
 		l.Debugf("%v Already tracked (type %v): %s", a, ev.evType, event.Name)
 		return
@@ -270,7 +288,7 @@ func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
 	if ok {
 		firstModTime = childDir.firstModTime()
 		if merged := event.Type.Merge(childDir.eventType()); event.Type != merged {
-			a.counts[event.Type]--
+			a.counts.add(event.Type, -1)
 			event.Type = merged
 		}
 		delete(parentDir.dirs, name)
@@ -281,7 +299,7 @@ func (a *aggregator) aggregateEvent(event fs.Event, evTime time.Time) {
 		lastModTime:  evTime,
 		evType:       event.Type,
 	}
-	a.counts[event.Type]++
+	a.counts.add(event.Type, 1)
 	a.resetNotifyTimerIfNeeded()
 }
 
@@ -300,7 +318,7 @@ func (a *aggregator) resetNotifyTimer(duration time.Duration) {
 }
 
 func (a *aggregator) actOnTimer(out chan<- []string) {
-	c := a.eventCount()
+	c := a.counts.total()
 	if c == 0 {
 		l.Debugln(a, "No tracked events, waiting for new event.")
 		a.notifyTimerNeedsReset = true
@@ -308,7 +326,7 @@ func (a *aggregator) actOnTimer(out chan<- []string) {
 	}
 	oldEvents := make(map[string]*aggregatedEvent, c)
 	a.popOldEventsTo(oldEvents, a.root, ".", time.Now(), true)
-	if a.notifyDelay != a.notifyTimeout && a.counts[fs.NonRemove] == 0 && a.counts[fs.Remove]+a.counts[fs.Mixed] != 0 {
+	if a.notifyDelay != a.notifyTimeout && a.counts.nonRemoves == 0 && a.counts.removes != 0 {
 		// Only delayed events remaining, no need to delay them additionally
 		a.popOldEventsTo(oldEvents, a.root, ".", time.Now(), false)
 	}
@@ -374,14 +392,14 @@ func (a *aggregator) popOldEventsTo(to map[string]*aggregatedEvent, dir *eventDi
 		if a.isOld(event, currTime, delayRem) {
 			to[filepath.Join(dirPath, name)] = event
 			delete(dir.events, name)
-			a.counts[event.evType]--
+			a.counts.add(event.evType, -1)
 		}
 	}
 }
 
 func (a *aggregator) isOld(ev *aggregatedEvent, currTime time.Time, delayRem bool) bool {
 	// Deletes should in general be scanned last, therefore they are delayed by
-	// letting them time out. This behaviour is overriden by delayRem == false.
+	// letting them time out. This behaviour is overridden by delayRem == false.
 	// Refer to following comments as to why.
 	// An event that has not registered any new modifications recently is scanned.
 	// a.notifyDelay is the user facing value signifying the normal delay between
@@ -395,27 +413,15 @@ func (a *aggregator) isOld(ev *aggregatedEvent, currTime time.Time, delayRem boo
 	// is delayed to reduce resource usage, but after a certain time (notifyTimeout)
 	// passed it is scanned anyway.
 	// If only removals are remaining to be scanned, there is no point to delay
-	// removals further, so this behaviour is overriden by delayRem == false.
+	// removals further, so this behaviour is overridden by delayRem == false.
 	return currTime.Sub(ev.firstModTime) > a.notifyTimeout
-}
-
-func (a *aggregator) eventCount() int {
-	c := 0
-	for _, v := range a.counts {
-		c += v
-	}
-	return c
 }
 
 func (a *aggregator) String() string {
 	return fmt.Sprintf("aggregator/%s:", a.folderCfg.Description())
 }
 
-func (a *aggregator) VerifyConfiguration(from, to config.Configuration) error {
-	return nil
-}
-
-func (a *aggregator) CommitConfiguration(from, to config.Configuration) bool {
+func (a *aggregator) CommitConfiguration(_, to config.Configuration) bool {
 	for _, folderCfg := range to.Folders {
 		if folderCfg.ID == a.folderID {
 			select {
@@ -431,7 +437,14 @@ func (a *aggregator) CommitConfiguration(from, to config.Configuration) bool {
 
 func (a *aggregator) updateConfig(folderCfg config.FolderConfiguration) {
 	a.notifyDelay = time.Duration(folderCfg.FSWatcherDelayS) * time.Second
-	a.notifyTimeout = notifyTimeout(folderCfg.FSWatcherDelayS)
+	if maxDelay := folderCfg.FSWatcherTimeoutS; maxDelay > 0 {
+		// FSWatcherTimeoutS is set explicitly so use that, but it also
+		// can't be lower than FSWatcherDelayS
+		a.notifyTimeout = time.Duration(max(maxDelay, folderCfg.FSWatcherDelayS)) * time.Second
+	} else {
+		// Use the default FSWatcherTimeoutS calculation
+		a.notifyTimeout = notifyTimeout(folderCfg.FSWatcherDelayS)
+	}
 	a.folderCfg = folderCfg
 }
 
@@ -450,11 +463,13 @@ func updateInProgressSet(event events.Event, inProgress map[string]struct{}) {
 // air, they were just considered as a sensible compromise between fast updates and
 // saving resources. For short delays the timeout is 6 times the delay, capped at 1
 // minute. For delays longer than 1 minute, the delay and timeout are equal.
-func notifyTimeout(eventDelayS int) time.Duration {
-	shortDelayS := 10
-	shortDelayMultiplicator := 6
-	longDelayS := 60
-	longDelayTimeout := time.Duration(1) * time.Minute
+func notifyTimeout(eventDelayS float64) time.Duration {
+	const (
+		shortDelayS             = 10
+		shortDelayMultiplicator = 6
+		longDelayS              = 60
+		longDelayTimeout        = time.Minute
+	)
 	if eventDelayS < shortDelayS {
 		return time.Duration(eventDelayS*shortDelayMultiplicator) * time.Second
 	}

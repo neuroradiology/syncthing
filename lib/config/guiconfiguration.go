@@ -9,29 +9,21 @@ package config
 import (
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/syncthing/syncthing/lib/rand"
 )
 
-type GUIConfiguration struct {
-	Enabled                   bool     `xml:"enabled,attr" json:"enabled" default:"true"`
-	RawAddress                string   `xml:"address" json:"address" default:"127.0.0.1:8384"`
-	User                      string   `xml:"user,omitempty" json:"user"`
-	Password                  string   `xml:"password,omitempty" json:"password"`
-	AuthMode                  AuthMode `xml:"authMode,omitempty" json:"authMode"`
-	RawUseTLS                 bool     `xml:"tls,attr" json:"useTLS"`
-	APIKey                    string   `xml:"apikey,omitempty" json:"apiKey"`
-	InsecureAdminAccess       bool     `xml:"insecureAdminAccess,omitempty" json:"insecureAdminAccess"`
-	Theme                     string   `xml:"theme" json:"theme" default:"default"`
-	Debugging                 bool     `xml:"debugging,attr" json:"debugging"`
-	InsecureSkipHostCheck     bool     `xml:"insecureSkipHostcheck,omitempty" json:"insecureSkipHostcheck"`
-	InsecureAllowFrameLoading bool     `xml:"insecureAllowFrameLoading,omitempty" json:"insecureAllowFrameLoading"`
-}
-
 func (c GUIConfiguration) IsAuthEnabled() bool {
+	// This function should match isAuthEnabled() in syncthingController.js
 	return c.AuthMode == AuthModeLDAP || (len(c.User) > 0 && len(c.Password) > 0)
 }
 
-func (c GUIConfiguration) IsOverridden() bool {
+func (GUIConfiguration) IsOverridden() bool {
 	return os.Getenv("STGUIADDRESS") != ""
 }
 
@@ -59,15 +51,22 @@ func (c GUIConfiguration) Address() string {
 	return c.RawAddress
 }
 
+func (c GUIConfiguration) UnixSocketPermissions() os.FileMode {
+	perm, err := strconv.ParseUint(c.RawUnixSocketPermissions, 8, 32)
+	if err != nil {
+		// ignore incorrectly formatted permissions
+		return 0
+	}
+	return os.FileMode(perm) & os.ModePerm
+}
+
 func (c GUIConfiguration) Network() string {
-	if override := os.Getenv("STGUIADDRESS"); strings.Contains(override, "/") {
+	if override := os.Getenv("STGUIADDRESS"); override != "" {
 		url, err := url.Parse(override)
-		if err != nil {
-			return "tcp"
-		}
-		if strings.HasPrefix(url.Scheme, "unix") {
+		if err == nil && strings.HasPrefix(url.Scheme, "unix") {
 			return "unix"
 		}
+		return "tcp"
 	}
 	if strings.HasPrefix(c.RawAddress, "/") {
 		return "unix"
@@ -77,19 +76,17 @@ func (c GUIConfiguration) Network() string {
 
 func (c GUIConfiguration) UseTLS() bool {
 	if override := os.Getenv("STGUIADDRESS"); override != "" {
-		if strings.HasPrefix(override, "http") {
-			return strings.HasPrefix(override, "https:")
-		}
-		if strings.HasPrefix(override, "unix") {
-			return strings.HasPrefix(override, "unixs:")
-		}
+		return strings.HasPrefix(override, "https:") || strings.HasPrefix(override, "unixs:")
 	}
 	return c.RawUseTLS
 }
 
 func (c GUIConfiguration) URL() string {
-	if strings.HasPrefix(c.RawAddress, "/") {
-		return "unix://" + c.RawAddress
+	if c.Network() == "unix" {
+		if c.UseTLS() {
+			return "unixs://" + c.Address()
+		}
+		return "unix://" + c.Address()
 	}
 
 	u := url.URL{
@@ -116,6 +113,33 @@ func (c GUIConfiguration) URL() string {
 	return u.String()
 }
 
+// matches a bcrypt hash and not too much else
+var bcryptExpr = regexp.MustCompile(`^\$2[aby]\$\d+\$.{50,}`)
+
+// SetPassword takes a bcrypt hash or a plaintext password and stores it.
+// Plaintext passwords are hashed. Returns an error if the password is not
+// valid.
+func (c *GUIConfiguration) SetPassword(password string) error {
+	if bcryptExpr.MatchString(password) {
+		// Already hashed
+		c.Password = password
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	c.Password = string(hash)
+	return nil
+}
+
+// CompareHashedPassword returns nil when the given plaintext password matches the stored hash.
+func (c GUIConfiguration) CompareHashedPassword(password string) error {
+	configPasswordBytes := []byte(c.Password)
+	passwordBytes := []byte(password)
+	return bcrypt.CompareHashAndPassword(configPasswordBytes, passwordBytes)
+}
+
 // IsValidAPIKey returns true when the given API key is valid, including both
 // the value in config and any overrides
 func (c GUIConfiguration) IsValidAPIKey(apiKey string) bool {
@@ -128,6 +152,12 @@ func (c GUIConfiguration) IsValidAPIKey(apiKey string) bool {
 
 	default:
 		return false
+	}
+}
+
+func (c *GUIConfiguration) prepare() {
+	if c.APIKey == "" {
+		c.APIKey = rand.String(32)
 	}
 }
 

@@ -9,7 +9,6 @@ package osutil
 import (
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/syncthing/syncthing/lib/fs"
 )
@@ -19,7 +18,7 @@ type TraversesSymlinkError struct {
 	path string
 }
 
-func (e TraversesSymlinkError) Error() string {
+func (e *TraversesSymlinkError) Error() string {
 	return fmt.Sprintf("traverses symlink: %s", e.path)
 }
 
@@ -28,7 +27,7 @@ type NotADirectoryError struct {
 	path string
 }
 
-func (e NotADirectoryError) Error() string {
+func (e *NotADirectoryError) Error() string {
 	return fmt.Sprintf("not a directory: %s", e.path)
 }
 
@@ -47,7 +46,7 @@ func TraversesSymlink(filesystem fs.Filesystem, name string) error {
 	}
 
 	var path string
-	for _, part := range strings.Split(name, string(fs.PathSeparator)) {
+	for _, part := range fs.PathComponents(name) {
 		path = filepath.Join(path, part)
 		info, err := filesystem.Lstat(path)
 		if err != nil {

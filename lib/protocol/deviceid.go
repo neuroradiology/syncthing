@@ -13,10 +13,16 @@ import (
 	"github.com/syncthing/syncthing/lib/sha256"
 )
 
-const DeviceIDLength = 32
+const (
+	DeviceIDLength = 32
+	// keep consistent with shortIDStringLength in gui/default/syncthing/app.js
+	ShortIDStringLength = 7
+)
 
-type DeviceID [DeviceIDLength]byte
-type ShortID uint64
+type (
+	DeviceID [DeviceIDLength]byte
+	ShortID  uint64
+)
 
 var (
 	LocalDeviceID  = repeatedDeviceID(0xff)
@@ -33,11 +39,7 @@ func repeatedDeviceID(v byte) (d DeviceID) {
 
 // NewDeviceID generates a new device ID from the raw bytes of a certificate
 func NewDeviceID(rawCert []byte) DeviceID {
-	var n DeviceID
-	hf := sha256.New()
-	hf.Write(rawCert)
-	hf.Sum(n[:0])
-	return n
+	return DeviceID(sha256.Sum256(rawCert))
 }
 
 func DeviceIDFromString(s string) (DeviceID, error) {
@@ -46,13 +48,13 @@ func DeviceIDFromString(s string) (DeviceID, error) {
 	return n, err
 }
 
-func DeviceIDFromBytes(bs []byte) DeviceID {
+func DeviceIDFromBytes(bs []byte) (DeviceID, error) {
 	var n DeviceID
 	if len(bs) != len(n) {
-		panic("incorrect length of byte slice representing device ID")
+		return n, errors.New("incorrect length of byte slice representing device ID")
 	}
 	copy(n[:], bs)
-	return n
+	return n, nil
 }
 
 // String returns the canonical string representation of the device ID
@@ -88,7 +90,7 @@ func (n DeviceID) Short() ShortID {
 	return ShortID(binary.BigEndian.Uint64(n[:]))
 }
 
-func (n *DeviceID) MarshalText() ([]byte, error) {
+func (n DeviceID) MarshalText() ([]byte, error) {
 	return []byte(n.String()), nil
 }
 
@@ -98,7 +100,7 @@ func (s ShortID) String() string {
 	}
 	var bs [8]byte
 	binary.BigEndian.PutUint64(bs[:], uint64(s))
-	return base32.StdEncoding.EncodeToString(bs[:])[:7]
+	return base32.StdEncoding.EncodeToString(bs[:])[:ShortIDStringLength]
 }
 
 func (n *DeviceID) UnmarshalText(bs []byte) error {
@@ -133,7 +135,7 @@ func (n *DeviceID) UnmarshalText(bs []byte) error {
 	}
 }
 
-func (n *DeviceID) ProtoSize() int {
+func (*DeviceID) ProtoSize() int {
 	// Used by protobuf marshaller.
 	return DeviceIDLength
 }
@@ -165,7 +167,7 @@ func luhnify(s string) (string, error) {
 	for i := 0; i < 4; i++ {
 		p := s[i*13 : (i+1)*13]
 		copy(res[i*(13+1):], p)
-		l, err := luhnBase32.generate(p)
+		l, err := luhn32(p)
 		if err != nil {
 			return "", err
 		}
@@ -183,7 +185,7 @@ func unluhnify(s string) (string, error) {
 	for i := 0; i < 4; i++ {
 		p := s[i*(13+1) : (i+1)*(13+1)-1]
 		copy(res[i*13:], p)
-		l, err := luhnBase32.generate(p)
+		l, err := luhn32(p)
 		if err != nil {
 			return "", err
 		}
@@ -207,29 +209,14 @@ func chunkify(s string) string {
 }
 
 func unchunkify(s string) string {
-	s = strings.Replace(s, "-", "", -1)
-	s = strings.Replace(s, " ", "", -1)
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, " ", "")
 	return s
 }
 
 func untypeoify(s string) string {
-	s = strings.Replace(s, "0", "O", -1)
-	s = strings.Replace(s, "1", "I", -1)
-	s = strings.Replace(s, "8", "B", -1)
+	s = strings.ReplaceAll(s, "0", "O")
+	s = strings.ReplaceAll(s, "1", "I")
+	s = strings.ReplaceAll(s, "8", "B")
 	return s
-}
-
-// DeviceIDs is a sortable slice of DeviceID
-type DeviceIDs []DeviceID
-
-func (l DeviceIDs) Len() int {
-	return len(l)
-}
-
-func (l DeviceIDs) Less(a, b int) bool {
-	return l[a].Compare(l[b]) == -1
-}
-
-func (l DeviceIDs) Swap(a, b int) {
-	l[a], l[b] = l[b], l[a]
 }

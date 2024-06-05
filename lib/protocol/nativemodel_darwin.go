@@ -1,5 +1,6 @@
 // Copyright (C) 2014 The Protocol Authors.
 
+//go:build darwin
 // +build darwin
 
 package protocol
@@ -8,25 +9,27 @@ package protocol
 
 import "golang.org/x/text/unicode/norm"
 
+func makeNative(m rawModel) rawModel { return nativeModel{m} }
+
 type nativeModel struct {
-	Model
+	rawModel
 }
 
-func (m nativeModel) Index(deviceID DeviceID, folder string, files []FileInfo) {
-	for i := range files {
-		files[i].Name = norm.NFD.String(files[i].Name)
+func (m nativeModel) Index(idx *Index) error {
+	for i := range idx.Files {
+		idx.Files[i].Name = norm.NFD.String(idx.Files[i].Name)
 	}
-	m.Model.Index(deviceID, folder, files)
+	return m.rawModel.Index(idx)
 }
 
-func (m nativeModel) IndexUpdate(deviceID DeviceID, folder string, files []FileInfo) {
-	for i := range files {
-		files[i].Name = norm.NFD.String(files[i].Name)
+func (m nativeModel) IndexUpdate(idxUp *IndexUpdate) error {
+	for i := range idxUp.Files {
+		idxUp.Files[i].Name = norm.NFD.String(idxUp.Files[i].Name)
 	}
-	m.Model.IndexUpdate(deviceID, folder, files)
+	return m.rawModel.IndexUpdate(idxUp)
 }
 
-func (m nativeModel) Request(deviceID DeviceID, folder, name string, size int32, offset int64, hash []byte, weakHash uint32, fromTemporary bool) (RequestResponse, error) {
-	name = norm.NFD.String(name)
-	return m.Model.Request(deviceID, folder, name, size, offset, hash, weakHash, fromTemporary)
+func (m nativeModel) Request(req *Request) (RequestResponse, error) {
+	req.Name = norm.NFD.String(req.Name)
+	return m.rawModel.Request(req)
 }

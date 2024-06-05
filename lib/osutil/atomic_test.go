@@ -8,8 +8,8 @@ package osutil
 
 import (
 	"bytes"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -34,7 +34,7 @@ func TestCreateAtomicCreate(t *testing.T) {
 		t.Fatal("written bytes", n, "!= 5")
 	}
 
-	if _, err := ioutil.ReadFile("testdata/file"); err == nil {
+	if _, err := os.ReadFile("testdata/file"); err == nil {
 		t.Fatal("file should not exist")
 	}
 
@@ -42,7 +42,7 @@ func TestCreateAtomicCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bs, err := ioutil.ReadFile("testdata/file")
+	bs, err := os.ReadFile("testdata/file")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,18 +52,41 @@ func TestCreateAtomicCreate(t *testing.T) {
 }
 
 func TestCreateAtomicReplace(t *testing.T) {
-	os.RemoveAll("testdata")
-	defer os.RemoveAll("testdata")
+	testCreateAtomicReplace(t, 0666)
+}
+func TestCreateAtomicReplaceReadOnly(t *testing.T) {
+	testCreateAtomicReplace(t, 0444) // windows compatible read-only bits
+}
 
-	if err := os.Mkdir("testdata", 0755); err != nil {
+func testCreateAtomicReplace(t *testing.T, oldPerms os.FileMode) {
+	t.Helper()
+
+	testdir := t.TempDir()
+	testfile := filepath.Join(testdir, "testfile")
+
+	os.RemoveAll(testdir)
+
+	if err := os.Mkdir(testdir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile("testdata/file", []byte("some old data"), 0644); err != nil {
+	if err := os.WriteFile(testfile, []byte("some old data"), oldPerms); err != nil {
 		t.Fatal(err)
 	}
 
-	w, err := CreateAtomic("testdata/file")
+	// Go < 1.14 has a bug in WriteFile where it does not use the requested
+	// permissions on Windows. Chmod to make sure.
+	if err := os.Chmod(testfile, oldPerms); err != nil {
+		t.Fatal(err)
+	}
+	// Trust, but verify.
+	if info, err := os.Stat(testfile); err != nil {
+		t.Fatal(err)
+	} else if info.Mode() != oldPerms {
+		t.Fatalf("Wrong perms 0%o", info.Mode())
+	}
+
+	w, err := CreateAtomic(testfile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +98,17 @@ func TestCreateAtomicReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bs, err := ioutil.ReadFile("testdata/file")
+	bs, err := os.ReadFile(testfile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(bs, []byte("hello")) {
 		t.Error("incorrect data")
+	}
+
+	if info, err := os.Stat(testfile); err != nil {
+		t.Fatal(err)
+	} else if info.Mode() != oldPerms {
+		t.Fatalf("Perms changed during atomic write: 0%o", info.Mode())
 	}
 }

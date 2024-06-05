@@ -7,7 +7,6 @@
 package main
 
 import (
-	"crypto/md5"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +14,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
+	"github.com/syncthing/syncthing/lib/sha256"
 )
 
 func main() {
@@ -60,7 +62,7 @@ func compareDirectories(dirs ...string) error {
 				} else if res[i].name > res[0].name {
 					return fmt.Errorf("%s missing %v (present in %s)", dirs[i], res[0], dirs[0])
 				}
-				return fmt.Errorf("Mismatch; %v (%s) != %v (%s)", res[i], dirs[i], res[0], dirs[0])
+				return fmt.Errorf("mismatch; %v (%s) != %v (%s)", res[i], dirs[i], res[0], dirs[0])
 			}
 		}
 
@@ -74,7 +76,7 @@ type fileInfo struct {
 	name string
 	mode os.FileMode
 	mod  int64
-	hash [16]byte
+	hash [sha256.Size]byte
 }
 
 func (f fileInfo) String() string {
@@ -106,11 +108,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 			if err != nil {
 				return err
 			}
-			h := md5.New()
-			h.Write([]byte(tgt))
-			hash := h.Sum(nil)
-
-			copy(f.hash[:], hash)
+			f.hash = sha256.Sum256([]byte(tgt))
 		} else if info.IsDir() {
 			f = fileInfo{
 				name: rn,
@@ -123,7 +121,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 				mode: info.Mode(),
 				mod:  info.ModTime().Unix(),
 			}
-			sum, err := md5file(path)
+			sum, err := sha256file(path)
 			if err != nil {
 				return err
 			}
@@ -150,14 +148,14 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 	return errc
 }
 
-func md5file(fname string) (hash [16]byte, err error) {
+func sha256file(fname string) (hash [sha256.Size]byte, err error) {
 	f, err := os.Open(fname)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	h := md5.New()
+	h := sha256.New()
 	io.Copy(h, f)
 	hb := h.Sum(nil)
 	copy(hash[:], hb)

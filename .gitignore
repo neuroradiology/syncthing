@@ -1,11 +1,10 @@
 /syncthing
 /stdiscosrv
-syncthing.exe
-stdiscosrv.exe
 *.tar.gz
 *.zip
 *.asc
 *.deb
+*.exe
 .jshintrc
 coverage.out
 files/pidx
@@ -15,11 +14,7 @@ coverage.xml
 syncthing.sig
 RELEASE
 deb
-lib/auto/gui.files.go
-snapcraft.yaml
-prime/
-snap/
-parts/
-stage/
-*.snap
 *.bz2
+/repos
+/proto/scripts/protoc-gen-gosyncthing
+/gui/next-gen-gui

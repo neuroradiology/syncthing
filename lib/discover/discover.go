@@ -7,15 +7,16 @@
 package discover
 
 import (
+	"context"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 )
 
 // A Finder provides lookup services of some kind.
 type Finder interface {
-	Lookup(deviceID protocol.DeviceID) (address []string, err error)
+	Lookup(ctx context.Context, deviceID protocol.DeviceID) (address []string, err error)
 	Error() error
 	String() string
 	Cache() map[protocol.DeviceID]CacheEntry
@@ -34,11 +35,6 @@ type CacheEntry struct {
 type FinderService interface {
 	Finder
 	suture.Service
-}
-
-type FinderMux interface {
-	Finder
-	ChildStatus() map[string]error
 }
 
 // The AddressLister answers questions about what addresses we are listening

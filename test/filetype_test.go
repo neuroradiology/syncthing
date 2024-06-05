@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rc"
 )
@@ -21,10 +23,12 @@ import (
 func TestFileTypeChange(t *testing.T) {
 	// Use no versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{}
 	cfg.SetFolder(fld)
+	os.Rename("h2/config.xml", "h2/config.xml.orig")
+	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
 	cfg.Save()
 
 	testFileTypeChange(t)
@@ -33,13 +37,15 @@ func TestFileTypeChange(t *testing.T) {
 func TestFileTypeChangeSimpleVersioning(t *testing.T) {
 	// Use simple versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{
 		Type:   "simple",
 		Params: map[string]string{"keep": "5"},
 	}
 	cfg.SetFolder(fld)
+	os.Rename("h2/config.xml", "h2/config.xml.orig")
+	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
 	cfg.Save()
 
 	testFileTypeChange(t)
@@ -48,12 +54,14 @@ func TestFileTypeChangeSimpleVersioning(t *testing.T) {
 func TestFileTypeChangeStaggeredVersioning(t *testing.T) {
 	// Use staggered versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{
 		Type: "staggered",
 	}
 	cfg.SetFolder(fld)
+	os.Rename("h2/config.xml", "h2/config.xml.orig")
+	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
 	cfg.Save()
 
 	testFileTypeChange(t)

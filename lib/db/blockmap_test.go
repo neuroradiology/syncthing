@@ -7,24 +7,11 @@
 package db
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
-
-func genBlocks(n int) []protocol.BlockInfo {
-	b := make([]protocol.BlockInfo, n)
-	for i := range b {
-		h := make([]byte, 32)
-		for j := range h {
-			h[j] = byte(i + j)
-		}
-		b[i].Size = int32(i)
-		b[i].Hash = h
-	}
-	return b
-}
 
 var f1, f2, f3 protocol.FileInfo
 var folders = []string{"folder1", "folder2"}
@@ -48,32 +35,86 @@ func init() {
 	}
 }
 
-func setup() (*Lowlevel, *BlockFinder) {
-	// Setup
-
-	db := OpenMemory()
+func setup(t testing.TB) (*Lowlevel, *BlockFinder) {
+	t.Helper()
+	db := newLowlevelMemory(t)
 	return db, NewBlockFinder(db)
 }
 
 func dbEmpty(db *Lowlevel) bool {
-	iter := db.NewIterator(util.BytesPrefix([]byte{KeyTypeBlock}), nil)
+	iter, err := db.NewPrefixIterator([]byte{KeyTypeBlock})
+	if err != nil {
+		panic(err)
+	}
 	defer iter.Release()
 	return !iter.Next()
 }
 
+func addToBlockMap(db *Lowlevel, folder []byte, fs []protocol.FileInfo) error {
+	t, err := db.newReadWriteTransaction()
+	if err != nil {
+		return err
+	}
+	defer t.close()
+
+	var keyBuf []byte
+	blockBuf := make([]byte, 4)
+	for _, f := range fs {
+		if !f.IsDirectory() && !f.IsDeleted() && !f.IsInvalid() {
+			name := []byte(f.Name)
+			for i, block := range f.Blocks {
+				binary.BigEndian.PutUint32(blockBuf, uint32(i))
+				keyBuf, err = t.keyer.GenerateBlockMapKey(keyBuf, folder, block.Hash, name)
+				if err != nil {
+					return err
+				}
+				if err := t.Put(keyBuf, blockBuf); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return t.Commit()
+}
+
+func discardFromBlockMap(db *Lowlevel, folder []byte, fs []protocol.FileInfo) error {
+	t, err := db.newReadWriteTransaction()
+	if err != nil {
+		return err
+	}
+	defer t.close()
+
+	var keyBuf []byte
+	for _, ef := range fs {
+		if !ef.IsDirectory() && !ef.IsDeleted() && !ef.IsInvalid() {
+			name := []byte(ef.Name)
+			for _, block := range ef.Blocks {
+				keyBuf, err = t.keyer.GenerateBlockMapKey(keyBuf, folder, block.Hash, name)
+				if err != nil {
+					return err
+				}
+				if err := t.Delete(keyBuf); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return t.Commit()
+}
+
 func TestBlockMapAddUpdateWipe(t *testing.T) {
-	db, f := setup()
+	db, f := setup(t)
+	defer db.Close()
 
 	if !dbEmpty(db) {
 		t.Fatal("db not empty")
 	}
 
-	m := NewBlockMap(db, "folder1")
+	folder := []byte("folder1")
 
 	f3.Type = protocol.FileInfoTypeDirectory
 
-	err := m.Add([]protocol.FileInfo{f1, f2, f3})
-	if err != nil {
+	if err := addToBlockMap(db, folder, []protocol.FileInfo{f1, f2, f3}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,12 +137,14 @@ func TestBlockMapAddUpdateWipe(t *testing.T) {
 		return true
 	})
 
+	if err := discardFromBlockMap(db, folder, []protocol.FileInfo{f1, f2, f3}); err != nil {
+		t.Fatal(err)
+	}
+
 	f1.Deleted = true
 	f2.LocalFlags = protocol.FlagLocalMustRescan // one of the invalid markers
 
-	// Should remove
-	err = m.Update([]protocol.FileInfo{f1, f2, f3})
-	if err != nil {
+	if err := addToBlockMap(db, folder, []protocol.FileInfo{f1, f2, f3}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -122,8 +165,7 @@ func TestBlockMapAddUpdateWipe(t *testing.T) {
 		return true
 	})
 
-	err = m.Drop()
-	if err != nil {
+	if err := db.dropFolder(folder); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,8 +174,7 @@ func TestBlockMapAddUpdateWipe(t *testing.T) {
 	}
 
 	// Should not add
-	err = m.Add([]protocol.FileInfo{f1, f2})
-	if err != nil {
+	if err := addToBlockMap(db, folder, []protocol.FileInfo{f1, f2}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -150,17 +191,16 @@ func TestBlockMapAddUpdateWipe(t *testing.T) {
 }
 
 func TestBlockFinderLookup(t *testing.T) {
-	db, f := setup()
+	db, f := setup(t)
+	defer db.Close()
 
-	m1 := NewBlockMap(db, "folder1")
-	m2 := NewBlockMap(db, "folder2")
+	folder1 := []byte("folder1")
+	folder2 := []byte("folder2")
 
-	err := m1.Add([]protocol.FileInfo{f1})
-	if err != nil {
+	if err := addToBlockMap(db, folder1, []protocol.FileInfo{f1}); err != nil {
 		t.Fatal(err)
 	}
-	err = m2.Add([]protocol.FileInfo{f1})
-	if err != nil {
+	if err := addToBlockMap(db, folder2, []protocol.FileInfo{f1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -186,10 +226,13 @@ func TestBlockFinderLookup(t *testing.T) {
 		t.Fatal("Incorrect count", counter)
 	}
 
+	if err := discardFromBlockMap(db, folder1, []protocol.FileInfo{f1}); err != nil {
+		t.Fatal(err)
+	}
+
 	f1.Deleted = true
 
-	err = m1.Update([]protocol.FileInfo{f1})
-	if err != nil {
+	if err := addToBlockMap(db, folder1, []protocol.FileInfo{f1}); err != nil {
 		t.Fatal(err)
 	}
 

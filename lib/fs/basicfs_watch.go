@@ -4,14 +4,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// +build !solaris,!darwin solaris,cgo darwin,cgo
+//go:build !(solaris && !cgo) && !(darwin && !cgo) && !(android && amd64)
+// +build !solaris cgo
+// +build !darwin cgo
+// +build !android !amd64
 
 package fs
 
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"unicode/utf8"
 
 	"github.com/syncthing/notify"
 )
@@ -21,15 +24,10 @@ import (
 // Not meant to be changed, but must be changeable for tests
 var backendBuffer = 500
 
-func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
-	evalRoot, err := evalSymlinks(f.root)
+func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, <-chan error, error) {
+	watchPath, roots, err := f.watchPaths(name)
 	if err != nil {
-		return nil, err
-	}
-
-	absName, err := rooted(name, evalRoot)
-	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	outChan := make(chan Event)
@@ -40,28 +38,33 @@ func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context
 		eventMask |= permEventMask
 	}
 
-	if ignore.SkipIgnoredDirs() {
-		absShouldIgnore := func(absPath string) bool {
-			return ignore.ShouldIgnore(f.unrootedChecked(absPath, evalRoot))
+	absShouldIgnore := func(absPath string) bool {
+		if !utf8.ValidString(absPath) {
+			return true
 		}
-		err = notify.WatchWithFilter(filepath.Join(absName, "..."), backendChan, absShouldIgnore, eventMask)
-	} else {
-		err = notify.Watch(filepath.Join(absName, "..."), backendChan, eventMask)
+
+		rel, err := f.unrootedChecked(absPath, roots)
+		if err != nil {
+			return true
+		}
+		return ignore.Match(rel).CanSkipDir()
 	}
+	err = notify.WatchWithFilter(watchPath, backendChan, absShouldIgnore, eventMask)
 	if err != nil {
 		notify.Stop(backendChan)
 		if reachedMaxUserWatches(err) {
 			err = errors.New("failed to setup inotify handler. Please increase inotify limits, see https://docs.syncthing.net/users/faq.html#inotify-limits")
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
-	go f.watchLoop(name, evalRoot, backendChan, outChan, ignore, ctx)
+	errChan := make(chan error)
+	go f.watchLoop(ctx, name, roots, backendChan, outChan, errChan, ignore)
 
-	return outChan, nil
+	return outChan, errChan, nil
 }
 
-func (f *BasicFilesystem) watchLoop(name, evalRoot string, backendChan chan notify.EventInfo, outChan chan<- Event, ignore Matcher, ctx context.Context) {
+func (f *BasicFilesystem) watchLoop(ctx context.Context, name string, roots []string, backendChan chan notify.EventInfo, outChan chan<- Event, errChan chan<- error, ignore Matcher) {
 	for {
 		// Detect channel overflow
 		if len(backendChan) == backendBuffer {
@@ -80,8 +83,26 @@ func (f *BasicFilesystem) watchLoop(name, evalRoot string, backendChan chan noti
 
 		select {
 		case ev := <-backendChan:
-			relPath := f.unrootedChecked(ev.Path(), evalRoot)
-			if ignore.ShouldIgnore(relPath) {
+			evPath := ev.Path()
+
+			if !utf8.ValidString(evPath) {
+				l.Debugln(f.Type(), f.URI(), "Watch: Ignoring invalid UTF-8")
+				continue
+			}
+
+			relPath, err := f.unrootedChecked(evPath, roots)
+			if err != nil {
+				select {
+				case errChan <- err:
+					l.Debugln(f.Type(), f.URI(), "Watch: Sending error", err)
+				case <-ctx.Done():
+				}
+				notify.Stop(backendChan)
+				l.Debugln(f.Type(), f.URI(), "Watch: Stopped due to", err)
+				return
+			}
+
+			if ignore.Match(relPath).IsIgnored() {
 				l.Debugln(f.Type(), f.URI(), "Watch: Ignoring", relPath)
 				continue
 			}
@@ -102,7 +123,7 @@ func (f *BasicFilesystem) watchLoop(name, evalRoot string, backendChan chan noti
 	}
 }
 
-func (f *BasicFilesystem) eventType(notifyType notify.Event) EventType {
+func (*BasicFilesystem) eventType(notifyType notify.Event) EventType {
 	if notifyType&rmEventMask != 0 {
 		return Remove
 	}

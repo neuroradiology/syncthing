@@ -7,12 +7,11 @@
 package versioner
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
@@ -29,7 +28,7 @@ func TestExternalNoCommand(t *testing.T) {
 
 	// The versioner should fail due to missing command.
 
-	e := External{
+	e := external{
 		filesystem: fs.NewFilesystem(fs.FilesystemTypeBasic, "."),
 		command:    "nonexistent command",
 	}
@@ -46,7 +45,7 @@ func TestExternalNoCommand(t *testing.T) {
 
 func TestExternal(t *testing.T) {
 	cmd := "./_external_test/external.sh %FOLDER_PATH% %FILE_PATH%"
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		cmd = `.\\_external_test\\external.bat %FOLDER_PATH% %FILE_PATH%`
 	}
 
@@ -62,7 +61,7 @@ func TestExternal(t *testing.T) {
 
 	// The versioner should run successfully.
 
-	e := External{
+	e := external{
 		filesystem: fs.NewFilesystem(fs.FilesystemTypeBasic, "."),
 		command:    cmd,
 	}
@@ -85,7 +84,7 @@ func prepForRemoval(t *testing.T, file string) {
 	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(file, []byte("hello\n"), 0644); err != nil {
+	if err := os.WriteFile(file, []byte("hello\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 }

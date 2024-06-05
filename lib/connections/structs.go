@@ -7,6 +7,7 @@
 package connections
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -15,36 +16,33 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/stats"
+
+	"github.com/thejerf/suture/v4"
 )
 
-// Connection is what we expose to the outside. It is a protocol.Connection
-// that can be closed and has some metadata.
-type Connection interface {
-	protocol.Connection
-	io.Closer
-	Type() string
-	Transport() string
+type tlsConn interface {
+	io.ReadWriteCloser
+	ConnectionState() tls.ConnectionState
 	RemoteAddr() net.Addr
-	Priority() int
-	String() string
-}
-
-// completeConn is the aggregation of an internalConn and the
-// protocol.Connection running on top of it. It implements the Connection
-// interface.
-type completeConn struct {
-	internalConn
-	protocol.Connection
+	SetDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+	LocalAddr() net.Addr
 }
 
 // internalConn is the raw TLS connection plus some metadata on where it
 // came from (type, priority).
 type internalConn struct {
-	*tls.Conn
-	connType connType
-	priority int
+	tlsConn
+	connType      connType
+	isLocal       bool
+	priority      int
+	establishedAt time.Time
+	connectionID  string // set after Hello exchange
 }
 
 type connType int
@@ -54,6 +52,8 @@ const (
 	connTypeRelayServer
 	connTypeTCPClient
 	connTypeTCPServer
+	connTypeQUICClient
+	connTypeQUICServer
 )
 
 func (t connType) String() string {
@@ -66,6 +66,10 @@ func (t connType) String() string {
 		return "tcp-client"
 	case connTypeTCPServer:
 		return "tcp-server"
+	case connTypeQUICClient:
+		return "quic-client"
+	case connTypeQUICServer:
+		return "quic-server"
 	default:
 		return "unknown-type"
 	}
@@ -77,27 +81,53 @@ func (t connType) Transport() string {
 		return "relay"
 	case connTypeTCPClient, connTypeTCPServer:
 		return "tcp"
+	case connTypeQUICClient, connTypeQUICServer:
+		return "quic"
 	default:
 		return "unknown"
 	}
+}
+
+func newInternalConn(tc tlsConn, connType connType, isLocal bool, priority int) internalConn {
+	now := time.Now()
+	return internalConn{
+		tlsConn:       tc,
+		connType:      connType,
+		isLocal:       isLocal,
+		priority:      priority,
+		establishedAt: now.Truncate(time.Second),
+	}
+}
+
+func (c internalConn) Close() error {
+	// *tls.Conn.Close() does more than it says on the tin. Specifically, it
+	// sends a TLS alert message, which might block forever if the
+	// connection is dead and we don't have a deadline set.
+	_ = c.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+	return c.tlsConn.Close()
 }
 
 func (c internalConn) Type() string {
 	return c.connType.String()
 }
 
+func (c internalConn) IsLocal() bool {
+	return c.isLocal
+}
+
 func (c internalConn) Priority() int {
 	return c.priority
 }
 
+func (c internalConn) Crypto() string {
+	cs := c.ConnectionState()
+	return fmt.Sprintf("%s-%s", tlsVersionNames[cs.Version], tlsCipherSuiteNames[cs.CipherSuite])
+}
+
 func (c internalConn) Transport() string {
 	transport := c.connType.Transport()
-	host, _, err := net.SplitHostPort(c.LocalAddr().String())
+	ip, err := osutil.IPFromAddr(c.RemoteAddr())
 	if err != nil {
-		return transport
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
 		return transport
 	}
 	if ip.To4() != nil {
@@ -106,31 +136,74 @@ func (c internalConn) Transport() string {
 	return transport + "6"
 }
 
+func (c internalConn) EstablishedAt() time.Time {
+	return c.establishedAt
+}
+
+func (c internalConn) ConnectionID() string {
+	return c.connectionID
+}
+
 func (c internalConn) String() string {
-	return fmt.Sprintf("%s-%s/%s", c.LocalAddr(), c.RemoteAddr(), c.Type())
+	t := "WAN"
+	if c.isLocal {
+		t = "LAN"
+	}
+	return fmt.Sprintf("%s-%s/%s/%s/%s-P%d-%s", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto(), t, c.Priority(), c.connectionID)
 }
 
 type dialerFactory interface {
-	New(*config.Wrapper, *tls.Config) genericDialer
-	Priority() int
+	New(config.OptionsConfiguration, *tls.Config, *registry.Registry, *lanChecker) genericDialer
 	AlwaysWAN() bool
 	Valid(config.Configuration) error
 	String() string
 }
 
+type commonDialer struct {
+	trafficClass      int
+	reconnectInterval time.Duration
+	tlsCfg            *tls.Config
+	lanChecker        *lanChecker
+	lanPriority       int
+	wanPriority       int
+	allowsMultiConns  bool
+}
+
+func (d *commonDialer) RedialFrequency() time.Duration {
+	return d.reconnectInterval
+}
+
+func (d *commonDialer) Priority(host string) int {
+	if d.lanChecker.isLANHost(host) {
+		return d.lanPriority
+	}
+	return d.wanPriority
+}
+
+func (d *commonDialer) AllowsMultiConns() bool {
+	return d.allowsMultiConns
+}
+
 type genericDialer interface {
-	Dial(protocol.DeviceID, *url.URL) (internalConn, error)
+	Dial(context.Context, protocol.DeviceID, *url.URL) (internalConn, error)
 	RedialFrequency() time.Duration
+	Priority(host string) int
+	AllowsMultiConns() bool
 }
 
 type listenerFactory interface {
-	New(*url.URL, *config.Wrapper, *tls.Config, chan internalConn, *nat.Service) genericListener
+	New(*url.URL, config.Wrapper, *tls.Config, chan internalConn, *nat.Service, *registry.Registry, *lanChecker) genericListener
 	Valid(config.Configuration) error
 }
 
+type ListenerAddresses struct {
+	URI          *url.URL
+	WANAddresses []*url.URL
+	LANAddresses []*url.URL
+}
+
 type genericListener interface {
-	Serve()
-	Stop()
+	suture.Service
 	URI() *url.URL
 	// A given address can potentially be mutated by the listener.
 	// For example we bind to tcp://0.0.0.0, but that for example might return
@@ -142,7 +215,7 @@ type genericListener interface {
 	WANAddresses() []*url.URL
 	LANAddresses() []*url.URL
 	Error() error
-	OnAddressesChanged(func(genericListener))
+	OnAddressesChanged(func(ListenerAddresses))
 	String() string
 	Factory() listenerFactory
 	NATType() string
@@ -150,47 +223,48 @@ type genericListener interface {
 
 type Model interface {
 	protocol.Model
-	AddConnection(conn Connection, hello protocol.HelloResult)
-	Connection(remoteID protocol.DeviceID) (Connection, bool)
-	OnHello(protocol.DeviceID, net.Addr, protocol.HelloResult) error
-	GetHello(protocol.DeviceID) protocol.HelloIntf
+	AddConnection(conn protocol.Connection, hello protocol.Hello)
+	OnHello(protocol.DeviceID, net.Addr, protocol.Hello) error
+	DeviceStatistics() (map[protocol.DeviceID]stats.DeviceStatistics, error)
 }
-
-// serviceFunc wraps a function to create a suture.Service without stop
-// functionality.
-type serviceFunc func()
-
-func (f serviceFunc) Serve() { f() }
-func (f serviceFunc) Stop()  {}
 
 type onAddressesChangedNotifier struct {
-	callbacks []func(genericListener)
+	callbacks []func(ListenerAddresses)
 }
 
-func (o *onAddressesChangedNotifier) OnAddressesChanged(callback func(genericListener)) {
+func (o *onAddressesChangedNotifier) OnAddressesChanged(callback func(ListenerAddresses)) {
 	o.callbacks = append(o.callbacks, callback)
 }
 
 func (o *onAddressesChangedNotifier) notifyAddressesChanged(l genericListener) {
+	o.notifyAddresses(ListenerAddresses{
+		URI:          l.URI(),
+		WANAddresses: l.WANAddresses(),
+		LANAddresses: l.LANAddresses(),
+	})
+}
+
+func (o *onAddressesChangedNotifier) clearAddresses(l genericListener) {
+	o.notifyAddresses(ListenerAddresses{
+		URI: l.URI(),
+	})
+}
+
+func (o *onAddressesChangedNotifier) notifyAddresses(l ListenerAddresses) {
 	for _, callback := range o.callbacks {
 		callback(l)
 	}
 }
 
 type dialTarget struct {
+	addr     string
 	dialer   genericDialer
 	priority int
 	uri      *url.URL
 	deviceID protocol.DeviceID
 }
 
-func (t dialTarget) Dial() (internalConn, error) {
+func (t dialTarget) Dial(ctx context.Context) (internalConn, error) {
 	l.Debugln("dialing", t.deviceID, t.uri, "prio", t.priority)
-	conn, err := t.dialer.Dial(t.deviceID, t.uri)
-	if err != nil {
-		l.Debugln("dialing", t.deviceID, t.uri, "error:", err)
-	} else {
-		l.Debugln("dialing", t.deviceID, t.uri, "success:", conn)
-	}
-	return conn, err
+	return t.dialer.Dial(ctx, t.deviceID, t.uri)
 }

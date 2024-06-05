@@ -10,43 +10,46 @@ package config
 import (
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
-	"path"
-	"path/filepath"
-	"runtime"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/netutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/upgrade"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/sliceutil"
+	"github.com/syncthing/syncthing/lib/structutil"
 )
 
 const (
 	OldestHandledVersion = 10
-	CurrentVersion       = 28
+	CurrentVersion       = 37
 	MaxRescanIntervalS   = 365 * 24 * 60 * 60
 )
 
 var (
 	// DefaultTCPPort defines default TCP port used if the URI does not specify one, for example tcp://0.0.0.0
 	DefaultTCPPort = 22000
+	// DefaultQUICPort defines default QUIC port used if the URI does not specify one, for example quic://0.0.0.0
+	DefaultQUICPort = 22000
 	// DefaultListenAddresses should be substituted when the configuration
 	// contains <listenAddress>default</listenAddress>. This is done by the
 	// "consumer" of the configuration as we don't want these saved to the
 	// config.
 	DefaultListenAddresses = []string{
-		util.Address("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultTCPPort))),
+		netutil.AddressURL("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultTCPPort))),
 		"dynamic+https://relays.syncthing.net/endpoint",
+		netutil.AddressURL("quic", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultQUICPort))),
 	}
+	DefaultGUIPort = 8384
 	// DefaultDiscoveryServersV4 should be substituted when the configuration
 	// contains <globalAnnounceServer>default-v4</globalAnnounceServer>.
 	DefaultDiscoveryServersV4 = []string{
@@ -64,79 +67,143 @@ var (
 	DefaultDiscoveryServers = append(DefaultDiscoveryServersV4, DefaultDiscoveryServersV6...)
 	// DefaultTheme is the default and fallback theme for the web UI.
 	DefaultTheme = "default"
+	// Default stun servers should be substituted when the configuration
+	// contains <stunServer>default</stunServer>.
+
+	// DefaultPrimaryStunServers are servers provided by us (to avoid causing the public servers burden)
+	DefaultPrimaryStunServers = []string{
+		"stun.syncthing.net:3478",
+	}
+	DefaultSecondaryStunServers = []string{
+		"stun.callwithus.com:3478",
+		"stun.counterpath.com:3478",
+		"stun.counterpath.net:3478",
+		"stun.ekiga.net:3478",
+		"stun.ideasip.com:3478",
+		"stun.internetcalls.com:3478",
+		"stun.schlund.de:3478",
+		"stun.sipgate.net:10000",
+		"stun.sipgate.net:3478",
+		"stun.voip.aebc.com:3478",
+		"stun.voiparound.com:3478",
+		"stun.voipbuster.com:3478",
+		"stun.voipstunt.com:3478",
+		"stun.xten.com:3478",
+	}
+)
+
+var (
+	errFolderIDEmpty     = errors.New("folder has empty ID")
+	errFolderIDDuplicate = errors.New("folder has duplicate ID")
+	errFolderPathEmpty   = errors.New("folder has empty path")
 )
 
 func New(myID protocol.DeviceID) Configuration {
 	var cfg Configuration
 	cfg.Version = CurrentVersion
-	cfg.OriginalVersion = CurrentVersion
 
-	util.SetDefaults(&cfg)
-	util.SetDefaults(&cfg.Options)
-	util.SetDefaults(&cfg.GUI)
+	cfg.Options.UnackedNotificationIDs = []string{"authenticationUserAndPassword"}
+
+	structutil.SetDefaults(&cfg)
 
 	// Can't happen.
 	if err := cfg.prepare(myID); err != nil {
-		panic("bug: error in preparing new folder: " + err.Error())
+		l.Warnln("bug: error in preparing new folder:", err)
+		panic("error in preparing new folder")
 	}
 
 	return cfg
 }
 
-func ReadXML(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
-	var cfg Configuration
+func (cfg *Configuration) ProbeFreePorts() error {
+	port, err := getFreePort("127.0.0.1", DefaultGUIPort)
+	if err != nil {
+		return fmt.Errorf("get free port (GUI): %w", err)
+	}
+	cfg.GUI.RawAddress = fmt.Sprintf("127.0.0.1:%d", port)
 
-	util.SetDefaults(&cfg)
-	util.SetDefaults(&cfg.Options)
-	util.SetDefaults(&cfg.GUI)
+	port, err = getFreePort("0.0.0.0", DefaultTCPPort)
+	if err != nil {
+		return fmt.Errorf("get free port (BEP): %w", err)
+	}
+	if port == DefaultTCPPort {
+		cfg.Options.RawListenAddresses = []string{"default"}
+	} else {
+		cfg.Options.RawListenAddresses = []string{
+			netutil.AddressURL("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port))),
+			"dynamic+https://relays.syncthing.net/endpoint",
+			netutil.AddressURL("quic", net.JoinHostPort("0.0.0.0", strconv.Itoa(port))),
+		}
+	}
+
+	return nil
+}
+
+type xmlConfiguration struct {
+	Configuration
+	XMLName xml.Name `xml:"configuration"`
+}
+
+func ReadXML(r io.Reader, myID protocol.DeviceID) (Configuration, int, error) {
+	var cfg xmlConfiguration
+
+	structutil.SetDefaults(&cfg)
 
 	if err := xml.NewDecoder(r).Decode(&cfg); err != nil {
-		return Configuration{}, err
+		return Configuration{}, 0, err
 	}
-	cfg.OriginalVersion = cfg.Version
+
+	originalVersion := cfg.Version
 
 	if err := cfg.prepare(myID); err != nil {
-		return Configuration{}, err
+		return Configuration{}, originalVersion, err
 	}
-	return cfg, nil
+	return cfg.Configuration, originalVersion, nil
 }
 
 func ReadJSON(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
-	var cfg Configuration
-
-	util.SetDefaults(&cfg)
-	util.SetDefaults(&cfg.Options)
-	util.SetDefaults(&cfg.GUI)
-
-	bs, err := ioutil.ReadAll(r)
+	bs, err := io.ReadAll(r)
 	if err != nil {
 		return Configuration{}, err
 	}
 
+	var cfg Configuration
+
+	structutil.SetDefaults(&cfg)
+
 	if err := json.Unmarshal(bs, &cfg); err != nil {
 		return Configuration{}, err
 	}
-	cfg.OriginalVersion = cfg.Version
+
+	// Unmarshal list of devices and folders separately to set defaults
+	var rawFoldersDevices struct {
+		Folders []json.RawMessage
+		Devices []json.RawMessage
+	}
+	if err := json.Unmarshal(bs, &rawFoldersDevices); err != nil {
+		return Configuration{}, err
+	}
+
+	cfg.Folders = make([]FolderConfiguration, len(rawFoldersDevices.Folders))
+	for i, bs := range rawFoldersDevices.Folders {
+		cfg.Folders[i] = cfg.Defaults.Folder.Copy()
+		if err := json.Unmarshal(bs, &cfg.Folders[i]); err != nil {
+			return Configuration{}, err
+		}
+	}
+
+	cfg.Devices = make([]DeviceConfiguration, len(rawFoldersDevices.Devices))
+	for i, bs := range rawFoldersDevices.Devices {
+		cfg.Devices[i] = cfg.Defaults.Device.Copy()
+		if err := json.Unmarshal(bs, &cfg.Devices[i]); err != nil {
+			return Configuration{}, err
+		}
+	}
 
 	if err := cfg.prepare(myID); err != nil {
 		return Configuration{}, err
 	}
 	return cfg, nil
-}
-
-type Configuration struct {
-	Version        int                   `xml:"version,attr" json:"version"`
-	Folders        []FolderConfiguration `xml:"folder" json:"folders"`
-	Devices        []DeviceConfiguration `xml:"device" json:"devices"`
-	GUI            GUIConfiguration      `xml:"gui" json:"gui"`
-	LDAP           LDAPConfiguration     `xml:"ldap" json:"ldap"`
-	Options        OptionsConfiguration  `xml:"options" json:"options"`
-	IgnoredDevices []ObservedDevice      `xml:"remoteIgnoredDevice" json:"remoteIgnoredDevices"`
-	PendingDevices []ObservedDevice      `xml:"pendingDevice" json:"pendingDevices"`
-	XMLName        xml.Name              `xml:"configuration" json:"-"`
-
-	MyID            protocol.DeviceID `xml:"-" json:"-"` // Provided by the instantiator.
-	OriginalVersion int               `xml:"-" json:"-"` // The version we read from disk, before any conversion
 }
 
 func (cfg Configuration) Copy() Configuration {
@@ -161,16 +228,14 @@ func (cfg Configuration) Copy() Configuration {
 	newCfg.IgnoredDevices = make([]ObservedDevice, len(cfg.IgnoredDevices))
 	copy(newCfg.IgnoredDevices, cfg.IgnoredDevices)
 
-	newCfg.PendingDevices = make([]ObservedDevice, len(cfg.PendingDevices))
-	copy(newCfg.PendingDevices, cfg.PendingDevices)
-
 	return newCfg
 }
 
 func (cfg *Configuration) WriteXML(w io.Writer) error {
 	e := xml.NewEncoder(w)
 	e.Indent("", "    ")
-	err := e.Encode(cfg)
+	xmlCfg := xmlConfiguration{Configuration: *cfg}
+	err := e.Encode(xmlCfg)
 	if err != nil {
 		return err
 	}
@@ -179,236 +244,169 @@ func (cfg *Configuration) WriteXML(w io.Writer) error {
 }
 
 func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
-	var myName string
+	cfg.ensureMyDevice(myID)
 
-	cfg.MyID = myID
-
-	// Ensure this device is present in the config
-	for _, device := range cfg.Devices {
-		if device.DeviceID == myID {
-			goto found
-		}
-	}
-
-	myName, _ = os.Hostname()
-	cfg.Devices = append(cfg.Devices, DeviceConfiguration{
-		DeviceID: myID,
-		Name:     myName,
-	})
-
-found:
-
-	if err := cfg.clean(); err != nil {
+	existingDevices, err := cfg.prepareFoldersAndDevices(myID)
+	if err != nil {
 		return err
 	}
 
-	// Ensure that we are part of the devices
-	for i := range cfg.Folders {
-		cfg.Folders[i].Devices = ensureDevicePresent(cfg.Folders[i].Devices, myID)
-	}
+	cfg.GUI.prepare()
+
+	guiPWIsSet := cfg.GUI.User != "" && cfg.GUI.Password != ""
+	cfg.Options.prepare(guiPWIsSet)
+
+	cfg.prepareIgnoredDevices(existingDevices)
+
+	cfg.Defaults.prepare(myID, existingDevices)
+
+	cfg.removeDeprecatedProtocols()
+
+	structutil.FillNilExceptDeprecated(cfg)
+
+	// TestIssue1750 relies on migrations happening after preparing options.
+	cfg.applyMigrations()
 
 	return nil
 }
 
-func (cfg *Configuration) clean() error {
-	util.FillNilSlices(&cfg.Options)
-
-	// Prepare folders and check for duplicates. Duplicates are bad and
-	// dangerous, can't currently be resolved in the GUI, and shouldn't
-	// happen when configured by the GUI. We return with an error in that
-	// situation.
-	existingFolders := make(map[string]*FolderConfiguration)
-	for i := range cfg.Folders {
-		folder := &cfg.Folders[i]
-		folder.prepare()
-
-		if folder.ID == "" {
-			return fmt.Errorf("folder with empty ID in configuration")
-		}
-
-		if _, ok := existingFolders[folder.ID]; ok {
-			return fmt.Errorf("duplicate folder ID %q in configuration", folder.ID)
-		}
-		existingFolders[folder.ID] = folder
+func (cfg *Configuration) ensureMyDevice(myID protocol.DeviceID) {
+	if myID == protocol.EmptyDeviceID {
+		return
 	}
-
-	cfg.Options.ListenAddresses = util.UniqueStrings(cfg.Options.ListenAddresses)
-	cfg.Options.GlobalAnnServers = util.UniqueStrings(cfg.Options.GlobalAnnServers)
-
-	if cfg.Version > 0 && cfg.Version < OldestHandledVersion {
-		l.Warnf("Configuration version %d is deprecated. Attempting best effort conversion, but please verify manually.", cfg.Version)
-	}
-
-	// Upgrade configuration versions as appropriate
-	if cfg.Version <= 10 {
-		convertV10V11(cfg)
-	}
-	if cfg.Version == 11 {
-		convertV11V12(cfg)
-	}
-	if cfg.Version == 12 {
-		convertV12V13(cfg)
-	}
-	if cfg.Version == 13 {
-		convertV13V14(cfg)
-	}
-	if cfg.Version == 14 {
-		convertV14V15(cfg)
-	}
-	if cfg.Version == 15 {
-		convertV15V16(cfg)
-	}
-	if cfg.Version == 16 {
-		convertV16V17(cfg)
-	}
-	if cfg.Version == 17 {
-		convertV17V18(cfg)
-	}
-	if cfg.Version == 18 {
-		convertV18V19(cfg)
-	}
-	if cfg.Version == 19 {
-		convertV19V20(cfg)
-	}
-	if cfg.Version == 20 {
-		convertV20V21(cfg)
-	}
-	if cfg.Version == 21 {
-		convertV21V22(cfg)
-	}
-	if cfg.Version == 22 {
-		convertV22V23(cfg)
-	}
-	if cfg.Version == 23 {
-		convertV23V24(cfg)
-	}
-	if cfg.Version == 24 {
-		convertV24V25(cfg)
-	}
-	if cfg.Version == 25 {
-		convertV25V26(cfg)
-	}
-	if cfg.Version == 26 {
-		convertV26V27(cfg)
-	}
-	if cfg.Version == 27 {
-		convertV27V28(cfg)
-	}
-
-	// Build a list of available devices
-	existingDevices := make(map[protocol.DeviceID]bool)
 	for _, device := range cfg.Devices {
-		existingDevices[device.DeviceID] = true
+		if device.DeviceID == myID {
+			return
+		}
 	}
 
+	myName, _ := os.Hostname()
+	cfg.Devices = append(cfg.Devices, DeviceConfiguration{
+		DeviceID: myID,
+		Name:     myName,
+	})
+}
+
+func (cfg *Configuration) prepareFoldersAndDevices(myID protocol.DeviceID) (map[protocol.DeviceID]*DeviceConfiguration, error) {
+	existingDevices := cfg.prepareDeviceList()
+
+	sharedFolders, err := cfg.prepareFolders(myID, existingDevices)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg.prepareDevices(sharedFolders)
+
+	return existingDevices, nil
+}
+
+func (cfg *Configuration) prepareDeviceList() map[protocol.DeviceID]*DeviceConfiguration {
 	// Ensure that the device list is
 	// - free from duplicates
+	// - no devices with empty ID
 	// - sorted by ID
-	cfg.Devices = ensureNoDuplicateDevices(cfg.Devices)
+	// Happen before preparting folders as that needs a correct device list.
+	cfg.Devices = ensureNoDuplicateOrEmptyIDDevices(cfg.Devices)
 	sort.Slice(cfg.Devices, func(a, b int) bool {
 		return cfg.Devices[a].DeviceID.Compare(cfg.Devices[b].DeviceID) == -1
 	})
 
+	// Build a list of available devices
+	existingDevices := make(map[protocol.DeviceID]*DeviceConfiguration, len(cfg.Devices))
+	for i, device := range cfg.Devices {
+		existingDevices[device.DeviceID] = &cfg.Devices[i]
+	}
+	return existingDevices
+}
+
+func (cfg *Configuration) prepareFolders(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) (map[protocol.DeviceID][]string, error) {
+	// Prepare folders and check for duplicates. Duplicates are bad and
+	// dangerous, can't currently be resolved in the GUI, and shouldn't
+	// happen when configured by the GUI. We return with an error in that
+	// situation.
+	sharedFolders := make(map[protocol.DeviceID][]string, len(cfg.Devices))
+	existingFolders := make(map[string]*FolderConfiguration, len(cfg.Folders))
+	for i := range cfg.Folders {
+		folder := &cfg.Folders[i]
+
+		if folder.ID == "" {
+			return nil, errFolderIDEmpty
+		}
+
+		if folder.Path == "" {
+			return nil, fmt.Errorf("folder %q: %w", folder.ID, errFolderPathEmpty)
+		}
+
+		if _, ok := existingFolders[folder.ID]; ok {
+			return nil, fmt.Errorf("folder %q: %w", folder.ID, errFolderIDDuplicate)
+		}
+
+		folder.prepare(myID, existingDevices)
+
+		existingFolders[folder.ID] = folder
+
+		for _, dev := range folder.Devices {
+			sharedFolders[dev.DeviceID] = append(sharedFolders[dev.DeviceID], folder.ID)
+		}
+	}
 	// Ensure that the folder list is sorted by ID
 	sort.Slice(cfg.Folders, func(a, b int) bool {
 		return cfg.Folders[a].ID < cfg.Folders[b].ID
 	})
+	return sharedFolders, nil
+}
 
-	// Ensure that in all folder configs
-	// - any loose devices are not present in the wrong places
-	// - there are no duplicate devices
-	// - the versioning configuration parameter map is not nil
-	sharedFolders := make(map[protocol.DeviceID][]string, len(cfg.Devices))
-	for i := range cfg.Folders {
-		cfg.Folders[i].Devices = ensureExistingDevices(cfg.Folders[i].Devices, existingDevices)
-		cfg.Folders[i].Devices = ensureNoDuplicateFolderDevices(cfg.Folders[i].Devices)
-		if cfg.Folders[i].Versioning.Params == nil {
-			cfg.Folders[i].Versioning.Params = map[string]string{}
-		}
-		sort.Slice(cfg.Folders[i].Devices, func(a, b int) bool {
-			return cfg.Folders[i].Devices[a].DeviceID.Compare(cfg.Folders[i].Devices[b].DeviceID) == -1
-		})
-		for _, dev := range cfg.Folders[i].Devices {
-			sharedFolders[dev.DeviceID] = append(sharedFolders[dev.DeviceID], cfg.Folders[i].ID)
-		}
-	}
-
+func (cfg *Configuration) prepareDevices(sharedFolders map[protocol.DeviceID][]string) {
 	for i := range cfg.Devices {
 		cfg.Devices[i].prepare(sharedFolders[cfg.Devices[i].DeviceID])
 	}
+}
 
-	// Very short reconnection intervals are annoying
-	if cfg.Options.ReconnectIntervalS < 5 {
-		cfg.Options.ReconnectIntervalS = 5
-	}
-
-	if cfg.GUI.APIKey == "" {
-		cfg.GUI.APIKey = rand.String(32)
-	}
-
+func (cfg *Configuration) prepareIgnoredDevices(existingDevices map[protocol.DeviceID]*DeviceConfiguration) map[protocol.DeviceID]bool {
 	// The list of ignored devices should not contain any devices that have
 	// been manually added to the config.
-	var newIgnoredDevices []ObservedDevice
-	ignoredDevices := make(map[protocol.DeviceID]bool)
+	newIgnoredDevices := cfg.IgnoredDevices[:0]
+	ignoredDevices := make(map[protocol.DeviceID]bool, len(cfg.IgnoredDevices))
 	for _, dev := range cfg.IgnoredDevices {
-		if !existingDevices[dev.ID] {
+		if _, ok := existingDevices[dev.ID]; !ok {
 			ignoredDevices[dev.ID] = true
 			newIgnoredDevices = append(newIgnoredDevices, dev)
 		}
 	}
 	cfg.IgnoredDevices = newIgnoredDevices
+	return ignoredDevices
+}
 
-	// The list of pending devices should not contain devices that were added manually, nor should it contain
-	// ignored devices.
-
-	// Sort by time, so that in case of duplicates latest "time" is used.
-	sort.Slice(cfg.PendingDevices, func(i, j int) bool {
-		return cfg.PendingDevices[i].Time.Before(cfg.PendingDevices[j].Time)
-	})
-
-	var newPendingDevices []ObservedDevice
-nextPendingDevice:
-	for _, pendingDevice := range cfg.PendingDevices {
-		if !existingDevices[pendingDevice.ID] && !ignoredDevices[pendingDevice.ID] {
-			// Deduplicate
-			for _, existingPendingDevice := range newPendingDevices {
-				if existingPendingDevice.ID == pendingDevice.ID {
-					continue nextPendingDevice
-				}
-			}
-			newPendingDevices = append(newPendingDevices, pendingDevice)
-		}
-	}
-	cfg.PendingDevices = newPendingDevices
-
+func (cfg *Configuration) removeDeprecatedProtocols() {
 	// Deprecated protocols are removed from the list of listeners and
 	// device addresses. So far just kcp*.
 	for _, prefix := range []string{"kcp"} {
-		cfg.Options.ListenAddresses = filterURLSchemePrefix(cfg.Options.ListenAddresses, prefix)
+		cfg.Options.RawListenAddresses = filterURLSchemePrefix(cfg.Options.RawListenAddresses, prefix)
 		for i := range cfg.Devices {
 			dev := &cfg.Devices[i]
 			dev.Addresses = filterURLSchemePrefix(dev.Addresses, prefix)
 		}
 	}
+}
 
-	// Initialize any empty slices
-	if cfg.Folders == nil {
-		cfg.Folders = []FolderConfiguration{}
-	}
-	if cfg.IgnoredDevices == nil {
-		cfg.IgnoredDevices = []ObservedDevice{}
-	}
-	if cfg.PendingDevices == nil {
-		cfg.PendingDevices = []ObservedDevice{}
-	}
-	if cfg.Options.AlwaysLocalNets == nil {
-		cfg.Options.AlwaysLocalNets = []string{}
-	}
-	if cfg.Options.UnackedNotificationIDs == nil {
-		cfg.Options.UnackedNotificationIDs = []string{}
+func (cfg *Configuration) applyMigrations() {
+	if cfg.Version > 0 && cfg.Version < OldestHandledVersion {
+		l.Warnf("Configuration version %d is deprecated. Attempting best effort conversion, but please verify manually.", cfg.Version)
 	}
 
-	return nil
+	// Upgrade configuration versions as appropriate
+	migrationsMut.Lock()
+	migrations.apply(cfg)
+	migrationsMut.Unlock()
+}
+
+func (cfg *Configuration) Device(id protocol.DeviceID) (DeviceConfiguration, int, bool) {
+	for i, device := range cfg.Devices {
+		if device.DeviceID == id {
+			return device, i, true
+		}
+	}
+	return DeviceConfiguration{}, 0, false
 }
 
 // DeviceMap returns a map of device ID to device configuration for the given configuration.
@@ -420,325 +418,80 @@ func (cfg *Configuration) DeviceMap() map[protocol.DeviceID]DeviceConfiguration 
 	return m
 }
 
-func convertV27V28(cfg *Configuration) {
-	// Show a notification about enabling filesystem watching
-	cfg.Options.UnackedNotificationIDs = append(cfg.Options.UnackedNotificationIDs, "fsWatcherNotification")
-	cfg.Version = 28
+func (cfg *Configuration) SetDevice(device DeviceConfiguration) {
+	cfg.SetDevices([]DeviceConfiguration{device})
 }
 
-func convertV26V27(cfg *Configuration) {
-	for i := range cfg.Folders {
-		f := &cfg.Folders[i]
-		if f.DeprecatedPullers != 0 {
-			f.PullerMaxPendingKiB = 128 * f.DeprecatedPullers
-			f.DeprecatedPullers = 0
-		}
-	}
-	cfg.Version = 27
-}
-
-func convertV25V26(cfg *Configuration) {
-	// triggers database update
-	cfg.Version = 26
-}
-
-func convertV24V25(cfg *Configuration) {
-	for i := range cfg.Folders {
-		cfg.Folders[i].FSWatcherDelayS = 10
-	}
-
-	cfg.Version = 25
-}
-
-func convertV23V24(cfg *Configuration) {
-	cfg.Options.URSeen = 2
-
-	cfg.Version = 24
-}
-
-func convertV22V23(cfg *Configuration) {
-	permBits := fs.FileMode(0777)
-	if runtime.GOOS == "windows" {
-		// Windows has no umask so we must chose a safer set of bits to
-		// begin with.
-		permBits = 0700
-	}
-
-	// Upgrade code remains hardcoded for .stfolder despite configurable
-	// marker name in later versions.
-
-	for i := range cfg.Folders {
-		fs := cfg.Folders[i].Filesystem()
-		// Invalid config posted, or tests.
-		if fs == nil {
-			continue
-		}
-		if stat, err := fs.Stat(DefaultMarkerName); err == nil && !stat.IsDir() {
-			err = fs.Remove(DefaultMarkerName)
-			if err == nil {
-				err = fs.Mkdir(DefaultMarkerName, permBits)
-				fs.Hide(DefaultMarkerName) // ignore error
-			}
-			if err != nil {
-				l.Infoln("Failed to upgrade folder marker:", err)
-			}
-		}
-	}
-
-	cfg.Version = 23
-}
-
-func convertV21V22(cfg *Configuration) {
-	for i := range cfg.Folders {
-		cfg.Folders[i].FilesystemType = fs.FilesystemTypeBasic
-		// Migrate to templated external versioner commands
-		if cfg.Folders[i].Versioning.Type == "external" {
-			cfg.Folders[i].Versioning.Params["command"] += " %FOLDER_PATH% %FILE_PATH%"
-		}
-	}
-
-	cfg.Version = 22
-}
-
-func convertV20V21(cfg *Configuration) {
-	for _, folder := range cfg.Folders {
-		if folder.FilesystemType != fs.FilesystemTypeBasic {
-			continue
-		}
-		switch folder.Versioning.Type {
-		case "simple", "trashcan":
-			// Clean out symlinks in the known place
-			cleanSymlinks(folder.Filesystem(), ".stversions")
-		case "staggered":
-			versionDir := folder.Versioning.Params["versionsPath"]
-			if versionDir == "" {
-				// default place
-				cleanSymlinks(folder.Filesystem(), ".stversions")
-			} else if filepath.IsAbs(versionDir) {
-				// absolute
-				cleanSymlinks(fs.NewFilesystem(fs.FilesystemTypeBasic, versionDir), ".")
-			} else {
-				// relative to folder
-				cleanSymlinks(folder.Filesystem(), versionDir)
-			}
-		}
-	}
-
-	cfg.Version = 21
-}
-
-func convertV19V20(cfg *Configuration) {
-	cfg.Options.MinHomeDiskFree = Size{Value: cfg.Options.DeprecatedMinHomeDiskFreePct, Unit: "%"}
-	cfg.Options.DeprecatedMinHomeDiskFreePct = 0
-
-	for i := range cfg.Folders {
-		cfg.Folders[i].MinDiskFree = Size{Value: cfg.Folders[i].DeprecatedMinDiskFreePct, Unit: "%"}
-		cfg.Folders[i].DeprecatedMinDiskFreePct = 0
-	}
-
-	cfg.Version = 20
-}
-
-func convertV18V19(cfg *Configuration) {
-	// Triggers a database tweak
-	cfg.Version = 19
-}
-
-func convertV17V18(cfg *Configuration) {
-	// Do channel selection for existing users. Those who have auto upgrades
-	// and usage reporting on default to the candidate channel. Others get
-	// stable.
-	if cfg.Options.URAccepted > 0 && cfg.Options.AutoUpgradeIntervalH > 0 {
-		cfg.Options.UpgradeToPreReleases = true
-	}
-
-	// Show a notification to explain what's going on, except if upgrades
-	// are disabled by compilation or environment variable in which case
-	// it's not relevant.
-	if !upgrade.DisabledByCompilation && os.Getenv("STNOUPGRADE") == "" {
-		cfg.Options.UnackedNotificationIDs = append(cfg.Options.UnackedNotificationIDs, "channelNotification")
-	}
-
-	cfg.Version = 18
-}
-
-func convertV16V17(cfg *Configuration) {
-	// Fsync = true removed
-
-	cfg.Version = 17
-}
-
-func convertV15V16(cfg *Configuration) {
-	// Triggers a database tweak
-	cfg.Version = 16
-}
-
-func convertV14V15(cfg *Configuration) {
-	// Undo v0.13.0 broken migration
-
-	for i, addr := range cfg.Options.GlobalAnnServers {
-		switch addr {
-		case "default-v4v2/":
-			cfg.Options.GlobalAnnServers[i] = "default-v4"
-		case "default-v6v2/":
-			cfg.Options.GlobalAnnServers[i] = "default-v6"
-		}
-	}
-
-	cfg.Version = 15
-}
-
-func convertV13V14(cfg *Configuration) {
-	// Not using the ignore cache is the new default. Disable it on existing
-	// configurations.
-	cfg.Options.CacheIgnoredFiles = false
-
-	// Migrate UPnP -> NAT options
-	cfg.Options.NATEnabled = cfg.Options.DeprecatedUPnPEnabled
-	cfg.Options.DeprecatedUPnPEnabled = false
-	cfg.Options.NATLeaseM = cfg.Options.DeprecatedUPnPLeaseM
-	cfg.Options.DeprecatedUPnPLeaseM = 0
-	cfg.Options.NATRenewalM = cfg.Options.DeprecatedUPnPRenewalM
-	cfg.Options.DeprecatedUPnPRenewalM = 0
-	cfg.Options.NATTimeoutS = cfg.Options.DeprecatedUPnPTimeoutS
-	cfg.Options.DeprecatedUPnPTimeoutS = 0
-
-	// Replace the default listen address "tcp://0.0.0.0:22000" with the
-	// string "default", but only if we also have the default relay pool
-	// among the relay servers as this is implied by the new "default"
-	// entry.
-	hasDefault := false
-	for _, raddr := range cfg.Options.DeprecatedRelayServers {
-		if raddr == "dynamic+https://relays.syncthing.net/endpoint" {
-			for i, addr := range cfg.Options.ListenAddresses {
-				if addr == "tcp://0.0.0.0:22000" {
-					cfg.Options.ListenAddresses[i] = "default"
-					hasDefault = true
-					break
-				}
-			}
-			break
-		}
-	}
-
-	// Copy relay addresses into listen addresses.
-	for _, addr := range cfg.Options.DeprecatedRelayServers {
-		if hasDefault && addr == "dynamic+https://relays.syncthing.net/endpoint" {
-			// Skip the default relay address if we already have the
-			// "default" entry in the list.
-			continue
-		}
-		if addr == "" {
-			continue
-		}
-		cfg.Options.ListenAddresses = append(cfg.Options.ListenAddresses, addr)
-	}
-
-	cfg.Options.DeprecatedRelayServers = nil
-
-	// For consistency
-	sort.Strings(cfg.Options.ListenAddresses)
-
-	var newAddrs []string
-	for _, addr := range cfg.Options.GlobalAnnServers {
-		uri, err := url.Parse(addr)
-		if err != nil {
-			// That's odd. Skip the broken address.
-			continue
-		}
-		if uri.Scheme == "https" {
-			uri.Path = path.Join(uri.Path, "v2") + "/"
-			addr = uri.String()
-		}
-
-		newAddrs = append(newAddrs, addr)
-	}
-	cfg.Options.GlobalAnnServers = newAddrs
-
-	for i, fcfg := range cfg.Folders {
-		if fcfg.DeprecatedReadOnly {
-			cfg.Folders[i].Type = FolderTypeSendOnly
-		} else {
-			cfg.Folders[i].Type = FolderTypeSendReceive
-		}
-		cfg.Folders[i].DeprecatedReadOnly = false
-	}
-	// v0.13-beta already had config version 13 but did not get the new URL
-	if cfg.Options.ReleasesURL == "https://api.github.com/repos/syncthing/syncthing/releases?per_page=30" {
-		cfg.Options.ReleasesURL = "https://upgrades.syncthing.net/meta.json"
-	}
-
-	cfg.Version = 14
-}
-
-func convertV12V13(cfg *Configuration) {
-	if cfg.Options.ReleasesURL == "https://api.github.com/repos/syncthing/syncthing/releases?per_page=30" {
-		cfg.Options.ReleasesURL = "https://upgrades.syncthing.net/meta.json"
-	}
-
-	cfg.Version = 13
-}
-
-func convertV11V12(cfg *Configuration) {
-	// Change listen address schema
-	for i, addr := range cfg.Options.ListenAddresses {
-		if len(addr) > 0 && !strings.HasPrefix(addr, "tcp://") {
-			cfg.Options.ListenAddresses[i] = util.Address("tcp", addr)
-		}
-	}
-
+func (cfg *Configuration) SetDevices(devices []DeviceConfiguration) {
+	inds := make(map[protocol.DeviceID]int, len(cfg.Devices))
 	for i, device := range cfg.Devices {
-		for j, addr := range device.Addresses {
-			if addr != "dynamic" && addr != "" {
-				cfg.Devices[i].Addresses[j] = util.Address("tcp", addr)
-			}
-		}
+		inds[device.DeviceID] = i
 	}
-
-	// Use new discovery server
-	var newDiscoServers []string
-	var useDefault bool
-	for _, addr := range cfg.Options.GlobalAnnServers {
-		if addr == "udp4://announce.syncthing.net:22026" {
-			useDefault = true
-		} else if addr == "udp6://announce-v6.syncthing.net:22026" {
-			useDefault = true
+	filtered := devices[:0]
+	for _, device := range devices {
+		if i, ok := inds[device.DeviceID]; ok {
+			cfg.Devices[i] = device
 		} else {
-			newDiscoServers = append(newDiscoServers, addr)
+			filtered = append(filtered, device)
 		}
 	}
-	if useDefault {
-		newDiscoServers = append(newDiscoServers, "default")
-	}
-	cfg.Options.GlobalAnnServers = newDiscoServers
-
-	// Use new multicast group
-	if cfg.Options.LocalAnnMCAddr == "[ff32::5222]:21026" {
-		cfg.Options.LocalAnnMCAddr = "[ff12::8384]:21027"
-	}
-
-	// Use new local discovery port
-	if cfg.Options.LocalAnnPort == 21025 {
-		cfg.Options.LocalAnnPort = 21027
-	}
-
-	// Set MaxConflicts to unlimited
-	for i := range cfg.Folders {
-		cfg.Folders[i].MaxConflicts = -1
-	}
-
-	cfg.Version = 12
+	cfg.Devices = append(cfg.Devices, filtered...)
 }
 
-func convertV10V11(cfg *Configuration) {
-	// Set minimum disk free of existing folders to 1%
-	for i := range cfg.Folders {
-		cfg.Folders[i].DeprecatedMinDiskFreePct = 1
+func (cfg *Configuration) Folder(id string) (FolderConfiguration, int, bool) {
+	for i, folder := range cfg.Folders {
+		if folder.ID == id {
+			return folder, i, true
+		}
 	}
-	cfg.Version = 11
+	return FolderConfiguration{}, 0, false
+}
+
+// FolderMap returns a map of folder ID to folder configuration for the given configuration.
+func (cfg *Configuration) FolderMap() map[string]FolderConfiguration {
+	m := make(map[string]FolderConfiguration, len(cfg.Folders))
+	for _, folder := range cfg.Folders {
+		m[folder.ID] = folder
+	}
+	return m
+}
+
+// FolderPasswords returns the folder passwords set for this device, for
+// folders that have an encryption password set.
+func (cfg Configuration) FolderPasswords(device protocol.DeviceID) map[string]string {
+	res := make(map[string]string, len(cfg.Folders))
+	for _, folder := range cfg.Folders {
+		if dev, ok := folder.Device(device); ok && dev.EncryptionPassword != "" {
+			res[folder.ID] = dev.EncryptionPassword
+		}
+	}
+	return res
+}
+
+func (cfg *Configuration) SetFolder(folder FolderConfiguration) {
+	cfg.SetFolders([]FolderConfiguration{folder})
+}
+
+func (cfg *Configuration) SetFolders(folders []FolderConfiguration) {
+	inds := make(map[string]int, len(cfg.Folders))
+	for i, folder := range cfg.Folders {
+		inds[folder.ID] = i
+	}
+	filtered := folders[:0]
+	for _, folder := range folders {
+		if i, ok := inds[folder.ID]; ok {
+			cfg.Folders[i] = folder
+		} else {
+			filtered = append(filtered, folder)
+		}
+	}
+	cfg.Folders = append(cfg.Folders, filtered...)
 }
 
 func ensureDevicePresent(devices []FolderDeviceConfiguration, myID protocol.DeviceID) []FolderDeviceConfiguration {
+	if myID == protocol.EmptyDeviceID {
+		return devices
+	}
 	for _, device := range devices {
 		if device.DeviceID.Equals(myID) {
 			return devices
@@ -752,7 +505,7 @@ func ensureDevicePresent(devices []FolderDeviceConfiguration, myID protocol.Devi
 	return devices
 }
 
-func ensureExistingDevices(devices []FolderDeviceConfiguration, existingDevices map[protocol.DeviceID]bool) []FolderDeviceConfiguration {
+func ensureExistingDevices(devices []FolderDeviceConfiguration, existingDevices map[protocol.DeviceID]*DeviceConfiguration) []FolderDeviceConfiguration {
 	count := len(devices)
 	i := 0
 loop:
@@ -785,14 +538,14 @@ loop:
 	return devices[0:count]
 }
 
-func ensureNoDuplicateDevices(devices []DeviceConfiguration) []DeviceConfiguration {
+func ensureNoDuplicateOrEmptyIDDevices(devices []DeviceConfiguration) []DeviceConfiguration {
 	count := len(devices)
 	i := 0
 	seenDevices := make(map[protocol.DeviceID]bool)
 loop:
 	for i < count {
 		id := devices[i].DeviceID
-		if _, ok := seenDevices[id]; ok {
+		if _, ok := seenDevices[id]; ok || id == protocol.EmptyDeviceID {
 			devices[i] = devices[count-1]
 			count--
 			continue loop
@@ -803,8 +556,24 @@ loop:
 	return devices[0:count]
 }
 
+func ensureNoUntrustedTrustingSharing(f *FolderConfiguration, devices []FolderDeviceConfiguration, existingDevices map[protocol.DeviceID]*DeviceConfiguration) []FolderDeviceConfiguration {
+	for i := 0; i < len(devices); i++ {
+		dev := devices[i]
+		if dev.EncryptionPassword != "" || f.Type == FolderTypeReceiveEncrypted {
+			// There's a password set or the folder is received encrypted, no check required
+			continue
+		}
+		if devCfg := existingDevices[dev.DeviceID]; devCfg.Untrusted {
+			l.Warnf("Folder %s (%s) is shared in trusted mode with untrusted device %s (%s); unsharing.", f.ID, f.Label, dev.DeviceID.Short(), devCfg.Name)
+			devices = sliceutil.RemoveAndZero(devices, i)
+			i--
+		}
+	}
+	return devices
+}
+
 func cleanSymlinks(filesystem fs.Filesystem, dir string) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		// We don't do symlinks on Windows. Additionally, there may
 		// be things that look like symlinks that are not, which we
 		// should leave alone. Deduplicated files, for example.
@@ -832,11 +601,81 @@ func filterURLSchemePrefix(addrs []string, prefix string) []string {
 			continue
 		}
 		if strings.HasPrefix(uri.Scheme, prefix) {
-			// Remove this entry
-			copy(addrs[i:], addrs[i+1:])
-			addrs = addrs[:len(addrs)-1]
+			addrs = sliceutil.RemoveAndZero(addrs, i)
 			i--
 		}
 	}
 	return addrs
+}
+
+// tried in succession and the first to succeed is returned. If none succeed,
+// a random high port is returned.
+func getFreePort(host string, ports ...int) (int, error) {
+	for _, port := range ports {
+		c, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			c.Close()
+			return port, nil
+		}
+	}
+
+	c, err := net.Listen("tcp", host+":0")
+	if err != nil {
+		return 0, err
+	}
+	addr := c.Addr().(*net.TCPAddr)
+	c.Close()
+	return addr.Port, nil
+}
+
+func (defaults *Defaults) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) {
+	ensureZeroForNodefault(&FolderConfiguration{}, &defaults.Folder)
+	ensureZeroForNodefault(&DeviceConfiguration{}, &defaults.Device)
+	defaults.Folder.prepare(myID, existingDevices)
+	defaults.Device.prepare(nil)
+}
+
+func ensureZeroForNodefault(empty interface{}, target interface{}) {
+	copyMatchingTag(empty, target, "nodefault", func(v string) bool {
+		if len(v) > 0 && v != "true" {
+			panic(fmt.Sprintf(`unexpected tag value: %s. expected untagged or "true"`, v))
+		}
+		return len(v) > 0
+	})
+}
+
+// copyMatchingTag copies fields tagged tag:"value" from "from" struct onto "to" struct.
+func copyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy func(value string) bool) {
+	fromStruct := reflect.ValueOf(from).Elem()
+	fromType := fromStruct.Type()
+
+	toStruct := reflect.ValueOf(to).Elem()
+	toType := toStruct.Type()
+
+	if fromType != toType {
+		panic(fmt.Sprintf("non equal types: %s != %s", fromType, toType))
+	}
+
+	for i := 0; i < toStruct.NumField(); i++ {
+		fromField := fromStruct.Field(i)
+		toField := toStruct.Field(i)
+
+		if !toField.CanSet() {
+			// Unexported fields
+			continue
+		}
+
+		structTag := toType.Field(i).Tag
+
+		v := structTag.Get(tag)
+		if shouldCopy(v) {
+			toField.Set(fromField)
+		}
+	}
+}
+
+func (i Ignores) Copy() Ignores {
+	out := Ignores{Lines: make([]string, len(i.Lines))}
+	copy(out.Lines, i.Lines)
+	return out
 }

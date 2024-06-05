@@ -12,84 +12,121 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 // see readShortAt()
 const randomBlockShift = 14 // 128k
 
-// fakefs is a fake filesystem for testing and benchmarking. It has the
+// fakeFS is a fake filesystem for testing and benchmarking. It has the
 // following properties:
 //
-// - File metadata is kept in RAM. Specifically, we remember which files and
-//   directories exist, their dates, permissions and sizes. Symlinks are
-//   not supported.
+//   - File metadata is kept in RAM. Specifically, we remember which files and
+//     directories exist, their dates, permissions and sizes. Symlinks are
+//     not supported.
 //
-// - File contents are generated pseudorandomly with just the file name as
-//   seed. Writes are discarded, other than having the effect of increasing
-//   the file size. If you only write data that you've read from a file with
-//   the same name on a different fakefs, you'll never know the difference...
+//   - File contents are generated pseudorandomly with just the file name as
+//     seed. Writes are discarded, other than having the effect of increasing
+//     the file size. If you only write data that you've read from a file with
+//     the same name on a different fakeFS, you'll never know the difference...
 //
 // - We totally ignore permissions - pretend you are root.
 //
-// - The root path can contain URL query-style parameters that pre populate
-//   the filesystem at creation with a certain amount of random data:
+//   - The root path can contain URL query-style parameters that pre populate
+//     the filesystem at creation with a certain amount of random data:
 //
 //     files=n    to generate n random files (default 0)
 //     maxsize=n  to generate files up to a total of n MiB (default 0)
 //     sizeavg=n  to set the average size of random files, in bytes (default 1<<20)
 //     seed=n     to set the initial random seed (default 0)
+//     insens=b   "true" makes filesystem case-insensitive Windows- or OSX-style (default false)
+//     latency=d  to set the amount of time each "disk" operation takes, where d is time.ParseDuration format
+//     content=true to save actual file contents instead of generating pseudorandomly; n.b. memory usage
+//     nostfolder=true skip the creation of .stfolder
 //
-// - Two fakefs:s pointing at the same root path see the same files.
-//
-type fakefs struct {
-	mut  sync.Mutex
-	root *fakeEntry
+// - Two fakeFS:s pointing at the same root path see the same files.
+type fakeFS struct {
+	counters    fakeFSCounters
+	uri         string
+	mut         sync.Mutex
+	root        *fakeEntry
+	insens      bool
+	withContent bool
+	latency     time.Duration
+	userCache   *userCache
+	groupCache  *groupCache
+}
+
+type fakeFSCounters struct {
+	Chmod       int64
+	Lchown      int64
+	Chtimes     int64
+	Create      int64
+	DirNames    int64
+	Lstat       int64
+	Mkdir       int64
+	MkdirAll    int64
+	Open        int64
+	OpenFile    int64
+	ReadSymlink int64
+	Remove      int64
+	RemoveAll   int64
+	Rename      int64
 }
 
 var (
-	fakefsMut sync.Mutex
-	fakefsFs  = make(map[string]*fakefs)
+	fakeFSMut   sync.Mutex
+	fakeFSCache = make(map[string]*fakeFS)
 )
 
-func newFakeFilesystem(root string) *fakefs {
-	fakefsMut.Lock()
-	defer fakefsMut.Unlock()
+func newFakeFilesystem(rootURI string, _ ...Option) *fakeFS {
+	fakeFSMut.Lock()
+	defer fakeFSMut.Unlock()
 
 	var params url.Values
-	uri, err := url.Parse(root)
+	uri, err := url.Parse(rootURI)
 	if err == nil {
-		root = uri.Path
 		params = uri.Query()
 	}
 
-	if fs, ok := fakefsFs[root]; ok {
+	if fs, ok := fakeFSCache[rootURI]; ok {
 		// Already have an fs at this path
 		return fs
 	}
 
-	fs := &fakefs{
+	fs := &fakeFS{
+		uri: "fake://" + rootURI,
 		root: &fakeEntry{
-			name:     "/",
-			isdir:    true,
-			mode:     0700,
-			mtime:    time.Now(),
-			children: make(map[string]*fakeEntry),
+			name:      "/",
+			entryType: fakeEntryTypeDir,
+			mode:      0o700,
+			mtime:     time.Now(),
+			children:  make(map[string]*fakeEntry),
 		},
+		userCache:  newValueCache(time.Hour, user.LookupId),
+		groupCache: newValueCache(time.Hour, user.LookupGroupId),
 	}
 
 	files, _ := strconv.Atoi(params.Get("files"))
 	maxsize, _ := strconv.Atoi(params.Get("maxsize"))
 	sizeavg, _ := strconv.Atoi(params.Get("sizeavg"))
 	seed, _ := strconv.Atoi(params.Get("seed"))
+
+	fs.insens = params.Get("insens") == "true"
+	fs.withContent = params.Get("content") == "true"
+	nostfolder := params.Get("nostfolder") == "true"
+
 	if sizeavg == 0 {
 		sizeavg = 1 << 20
 	}
@@ -105,7 +142,7 @@ func newFakeFilesystem(root string) *fakefs {
 		for (files == 0 || createdFiles < files) && (maxsize == 0 || writtenData>>20 < int64(maxsize)) {
 			dir := filepath.Join(fmt.Sprintf("%02x", rng.Intn(255)), fmt.Sprintf("%02x", rng.Intn(255)))
 			file := fmt.Sprintf("%016x", rng.Int63())
-			fs.MkdirAll(dir, 0755)
+			fs.MkdirAll(dir, 0o755)
 
 			fd, _ := fs.Create(filepath.Join(dir, file))
 			createdFiles++
@@ -119,24 +156,46 @@ func newFakeFilesystem(root string) *fakefs {
 		}
 	}
 
-	// Also create a default folder marker for good measure
-	fs.Mkdir(".stfolder", 0700)
+	if !nostfolder {
+		// Also create a default folder marker for good measure
+		fs.Mkdir(".stfolder", 0o700)
+	}
 
-	fakefsFs[root] = fs
+	// We only set the latency after doing the operations required to create
+	// the filesystem initially.
+	fs.latency, _ = time.ParseDuration(params.Get("latency"))
+
+	fakeFSCache[rootURI] = fs
 	return fs
 }
 
+type fakeEntryType int
+
+const (
+	fakeEntryTypeFile fakeEntryType = iota
+	fakeEntryTypeDir
+	fakeEntryTypeSymlink
+)
+
 // fakeEntry is an entry (file or directory) in the fake filesystem
 type fakeEntry struct {
-	name     string
-	isdir    bool
-	size     int64
-	mode     FileMode
-	mtime    time.Time
-	children map[string]*fakeEntry
+	name      string
+	entryType fakeEntryType
+	dest      string // for symlinks
+	size      int64
+	mode      FileMode
+	uid       int
+	gid       int
+	mtime     time.Time
+	children  map[string]*fakeEntry
+	content   []byte
 }
 
-func (fs *fakefs) entryForName(name string) *fakeEntry {
+func (fs *fakeFS) entryForName(name string) *fakeEntry {
+	if fs.insens {
+		name = UnicodeLowercaseNormalized(name)
+	}
+
 	name = filepath.ToSlash(name)
 	if name == "." || name == "/" {
 		return fs.root
@@ -145,19 +204,30 @@ func (fs *fakefs) entryForName(name string) *fakeEntry {
 	name = strings.Trim(name, "/")
 	comps := strings.Split(name, "/")
 	entry := fs.root
-	for _, comp := range comps {
+	for i, comp := range comps {
+		if entry.entryType != fakeEntryTypeDir {
+			return nil
+		}
 		var ok bool
 		entry, ok = entry.children[comp]
 		if !ok {
 			return nil
 		}
+		if i < len(comps)-1 && entry.entryType == fakeEntryTypeSymlink {
+			// only absolute link targets are supported, and we assume
+			// lookup is Lstat-kind so we only resolve symlinks when they
+			// are not the last path component.
+			return fs.entryForName(entry.dest)
+		}
 	}
 	return entry
 }
 
-func (fs *fakefs) Chmod(name string, mode FileMode) error {
+func (fs *fakeFS) Chmod(name string, mode FileMode) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Chmod++
+	time.Sleep(fs.latency)
 	entry := fs.entryForName(name)
 	if entry == nil {
 		return os.ErrNotExist
@@ -166,9 +236,25 @@ func (fs *fakefs) Chmod(name string, mode FileMode) error {
 	return nil
 }
 
-func (fs *fakefs) Chtimes(name string, atime time.Time, mtime time.Time) error {
+func (fs *fakeFS) Lchown(name, uid, gid string) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Lchown++
+	time.Sleep(fs.latency)
+	entry := fs.entryForName(name)
+	if entry == nil {
+		return os.ErrNotExist
+	}
+	entry.uid, _ = strconv.Atoi(uid)
+	entry.gid, _ = strconv.Atoi(gid)
+	return nil
+}
+
+func (fs *fakeFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	fs.counters.Chtimes++
+	time.Sleep(fs.latency)
 	entry := fs.entryForName(name)
 	if entry == nil {
 		return os.ErrNotExist
@@ -177,18 +263,26 @@ func (fs *fakefs) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	return nil
 }
 
-func (fs *fakefs) Create(name string) (File, error) {
+func (fs *fakeFS) create(name string) (*fakeEntry, error) {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Create++
+	time.Sleep(fs.latency)
 
 	if entry := fs.entryForName(name); entry != nil {
-		if entry.isdir {
+		if entry.entryType == fakeEntryTypeDir {
 			return nil, os.ErrExist
+		} else if entry.entryType == fakeEntryTypeSymlink {
+			return nil, errors.New("following symlink not supported")
 		}
 		entry.size = 0
 		entry.mtime = time.Now()
-		entry.mode = 0666
-		return &fakeFile{fakeEntry: entry}, nil
+		entry.mode = 0o666
+		entry.content = nil
+		if fs.withContent {
+			entry.content = make([]byte, 0)
+		}
+		return entry, nil
 	}
 
 	dir := filepath.Dir(name)
@@ -199,20 +293,48 @@ func (fs *fakefs) Create(name string) (File, error) {
 	}
 	new := &fakeEntry{
 		name:  base,
-		mode:  0666,
+		mode:  0o666,
 		mtime: time.Now(),
 	}
+
+	if fs.insens {
+		base = UnicodeLowercaseNormalized(base)
+	}
+
+	if fs.withContent {
+		new.content = make([]byte, 0)
+	}
+
 	entry.children[base] = new
-	return &fakeFile{fakeEntry: new}, nil
+	return new, nil
 }
 
-func (fs *fakefs) CreateSymlink(target, name string) error {
-	return errors.New("not implemented")
+func (fs *fakeFS) Create(name string) (File, error) {
+	entry, err := fs.create(name)
+	if err != nil {
+		return nil, err
+	}
+	if fs.insens {
+		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name), mut: &fs.mut}, nil
+	}
+	return &fakeFile{fakeEntry: entry, mut: &fs.mut}, nil
 }
 
-func (fs *fakefs) DirNames(name string) ([]string, error) {
+func (fs *fakeFS) CreateSymlink(target, name string) error {
+	entry, err := fs.create(name)
+	if err != nil {
+		return err
+	}
+	entry.entryType = fakeEntryTypeSymlink
+	entry.dest = target
+	return nil
+}
+
+func (fs *fakeFS) DirNames(name string) ([]string, error) {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.DirNames++
+	time.Sleep(fs.latency)
 
 	entry := fs.entryForName(name)
 	if entry == nil {
@@ -220,67 +342,95 @@ func (fs *fakefs) DirNames(name string) ([]string, error) {
 	}
 
 	names := make([]string, 0, len(entry.children))
-	for name := range entry.children {
-		names = append(names, name)
+	for _, child := range entry.children {
+		names = append(names, child.name)
 	}
 
 	return names, nil
 }
 
-func (fs *fakefs) Lstat(name string) (FileInfo, error) {
+func (fs *fakeFS) Lstat(name string) (FileInfo, error) {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Lstat++
+	time.Sleep(fs.latency)
 
 	entry := fs.entryForName(name)
 	if entry == nil {
 		return nil, os.ErrNotExist
 	}
-	return &fakeFileInfo{*entry}, nil
+
+	info := &fakeFileInfo{*entry}
+	if fs.insens {
+		info.name = filepath.Base(name)
+	}
+
+	return info, nil
 }
 
-func (fs *fakefs) Mkdir(name string, perm FileMode) error {
+func (fs *fakeFS) Mkdir(name string, perm FileMode) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Mkdir++
+	time.Sleep(fs.latency)
 
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	entry := fs.entryForName(dir)
+	key := base
+
 	if entry == nil {
 		return os.ErrNotExist
 	}
-	if _, ok := entry.children[base]; ok {
+	if entry.entryType != fakeEntryTypeDir {
+		return os.ErrExist
+	}
+	if fs.insens {
+		key = UnicodeLowercaseNormalized(key)
+	}
+	if _, ok := entry.children[key]; ok {
 		return os.ErrExist
 	}
 
-	entry.children[base] = &fakeEntry{
-		name:     base,
-		isdir:    true,
-		mode:     perm,
-		mtime:    time.Now(),
-		children: make(map[string]*fakeEntry),
+	entry.children[key] = &fakeEntry{
+		name:      base,
+		entryType: fakeEntryTypeDir,
+		mode:      perm,
+		mtime:     time.Now(),
+		children:  make(map[string]*fakeEntry),
 	}
 	return nil
 }
 
-func (fs *fakefs) MkdirAll(name string, perm FileMode) error {
+func (fs *fakeFS) MkdirAll(name string, perm FileMode) error {
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	fs.counters.MkdirAll++
+	time.Sleep(fs.latency)
+
 	name = filepath.ToSlash(name)
 	name = strings.Trim(name, "/")
 	comps := strings.Split(name, "/")
 	entry := fs.root
 	for _, comp := range comps {
-		next, ok := entry.children[comp]
+		key := comp
+		if fs.insens {
+			key = UnicodeLowercaseNormalized(key)
+		}
+
+		next, ok := entry.children[key]
 
 		if !ok {
 			new := &fakeEntry{
-				name:     comp,
-				isdir:    true,
-				mode:     perm,
-				mtime:    time.Now(),
-				children: make(map[string]*fakeEntry),
+				name:      comp,
+				entryType: fakeEntryTypeDir,
+				mode:      perm,
+				mtime:     time.Now(),
+				children:  make(map[string]*fakeEntry),
 			}
-			entry.children[comp] = new
+			entry.children[key] = new
 			next = new
-		} else if !next.isdir {
+		} else if next.entryType != fakeEntryTypeDir {
 			return errors.New("not a directory")
 		}
 
@@ -289,34 +439,49 @@ func (fs *fakefs) MkdirAll(name string, perm FileMode) error {
 	return nil
 }
 
-func (fs *fakefs) Open(name string) (File, error) {
+func (fs *fakeFS) Open(name string) (File, error) {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Open++
+	time.Sleep(fs.latency)
 
 	entry := fs.entryForName(name)
-	if entry == nil {
+	if entry == nil || entry.entryType != fakeEntryTypeFile {
 		return nil, os.ErrNotExist
 	}
-	return &fakeFile{fakeEntry: entry}, nil
+
+	if fs.insens {
+		return &fakeFile{fakeEntry: entry, presentedName: filepath.Base(name), mut: &fs.mut}, nil
+	}
+	return &fakeFile{fakeEntry: entry, mut: &fs.mut}, nil
 }
 
-func (fs *fakefs) OpenFile(name string, flags int, mode FileMode) (File, error) {
-	fs.mut.Lock()
-	defer fs.mut.Unlock()
-
+func (fs *fakeFS) OpenFile(name string, flags int, mode FileMode) (File, error) {
 	if flags&os.O_CREATE == 0 {
 		return fs.Open(name)
 	}
 
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	fs.counters.OpenFile++
+	time.Sleep(fs.latency)
+
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	entry := fs.entryForName(dir)
+	key := base
+
 	if entry == nil {
 		return nil, os.ErrNotExist
+	} else if entry.entryType != fakeEntryTypeDir {
+		return nil, errors.New("not a directory")
 	}
 
+	if fs.insens {
+		key = UnicodeLowercaseNormalized(key)
+	}
 	if flags&os.O_EXCL != 0 {
-		if _, ok := entry.children[base]; ok {
+		if _, ok := entry.children[key]; ok {
 			return nil, os.ErrExist
 		}
 	}
@@ -326,18 +491,38 @@ func (fs *fakefs) OpenFile(name string, flags int, mode FileMode) (File, error) 
 		mode:  mode,
 		mtime: time.Now(),
 	}
+	if fs.withContent {
+		newEntry.content = make([]byte, 0)
+	}
 
-	entry.children[base] = newEntry
-	return &fakeFile{fakeEntry: newEntry}, nil
+	entry.children[key] = newEntry
+	return &fakeFile{fakeEntry: newEntry, mut: &fs.mut}, nil
 }
 
-func (fs *fakefs) ReadSymlink(name string) (string, error) {
-	return "", errors.New("not implemented")
-}
-
-func (fs *fakefs) Remove(name string) error {
+func (fs *fakeFS) ReadSymlink(name string) (string, error) {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.ReadSymlink++
+	time.Sleep(fs.latency)
+
+	entry := fs.entryForName(name)
+	if entry == nil {
+		return "", os.ErrNotExist
+	} else if entry.entryType != fakeEntryTypeSymlink {
+		return "", errors.New("not a symlink")
+	}
+	return entry.dest, nil
+}
+
+func (fs *fakeFS) Remove(name string) error {
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	fs.counters.Remove++
+	time.Sleep(fs.latency)
+
+	if fs.insens {
+		name = UnicodeLowercaseNormalized(name)
+	}
 
 	entry := fs.entryForName(name)
 	if entry == nil {
@@ -352,13 +537,19 @@ func (fs *fakefs) Remove(name string) error {
 	return nil
 }
 
-func (fs *fakefs) RemoveAll(name string) error {
+func (fs *fakeFS) RemoveAll(name string) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.RemoveAll++
+	time.Sleep(fs.latency)
+
+	if fs.insens {
+		name = UnicodeLowercaseNormalized(name)
+	}
 
 	entry := fs.entryForName(filepath.Dir(name))
 	if entry == nil {
-		return os.ErrNotExist
+		return nil // all tested real systems exhibit this behaviour
 	}
 
 	// RemoveAll is easy when the file system uses garbage collection under
@@ -367,16 +558,26 @@ func (fs *fakefs) RemoveAll(name string) error {
 	return nil
 }
 
-func (fs *fakefs) Rename(oldname, newname string) error {
+func (fs *fakeFS) Rename(oldname, newname string) error {
 	fs.mut.Lock()
 	defer fs.mut.Unlock()
+	fs.counters.Rename++
+	time.Sleep(fs.latency)
+
+	oldKey := filepath.Base(oldname)
+	newKey := filepath.Base(newname)
+
+	if fs.insens {
+		oldKey = UnicodeLowercaseNormalized(oldKey)
+		newKey = UnicodeLowercaseNormalized(newKey)
+	}
 
 	p0 := fs.entryForName(filepath.Dir(oldname))
 	if p0 == nil {
 		return os.ErrNotExist
 	}
 
-	entry := p0.children[filepath.Base(oldname)]
+	entry := p0.children[oldKey]
 	if entry == nil {
 		return os.ErrNotExist
 	}
@@ -386,77 +587,163 @@ func (fs *fakefs) Rename(oldname, newname string) error {
 		return os.ErrNotExist
 	}
 
-	dst, ok := p1.children[filepath.Base(newname)]
-	if ok && dst.isdir {
-		return errors.New("is a directory")
+	dst, ok := p1.children[newKey]
+	if ok {
+		if fs.insens && newKey == oldKey {
+			// case-only in-place rename
+			entry.name = filepath.Base(newname)
+			return nil
+		}
+
+		if dst.entryType == fakeEntryTypeDir {
+			return errors.New("is a directory")
+		}
 	}
 
-	p1.children[filepath.Base(newname)] = entry
-	delete(p0.children, filepath.Base(oldname))
+	p1.children[newKey] = entry
+	entry.name = filepath.Base(newname)
+
+	delete(p0.children, oldKey)
+
 	return nil
 }
 
-func (fs *fakefs) Stat(name string) (FileInfo, error) {
+func (fs *fakeFS) Stat(name string) (FileInfo, error) {
 	return fs.Lstat(name)
 }
 
-func (fs *fakefs) SymlinksSupported() bool {
+func (*fakeFS) SymlinksSupported() bool {
 	return false
 }
 
-func (fs *fakefs) Walk(name string, walkFn WalkFunc) error {
+func (*fakeFS) Walk(_ string, _ WalkFunc) error {
 	return errors.New("not implemented")
 }
 
-func (fs *fakefs) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
-	return nil, ErrWatchNotSupported
+func (*fakeFS) Watch(_ string, _ Matcher, _ context.Context, _ bool) (<-chan Event, <-chan error, error) {
+	return nil, nil, ErrWatchNotSupported
 }
 
-func (fs *fakefs) Hide(name string) error {
+func (*fakeFS) Hide(_ string) error {
 	return nil
 }
 
-func (fs *fakefs) Unhide(name string) error {
+func (*fakeFS) Unhide(_ string) error {
 	return nil
 }
 
-func (fs *fakefs) Glob(pattern string) ([]string, error) {
-	// gnnh we don't seem to actually require this in practice
-	return nil, errors.New("not implemented")
+func (*fakeFS) GetXattr(_ string, _ XattrFilter) ([]protocol.Xattr, error) {
+	return nil, nil
 }
 
-func (fs *fakefs) Roots() ([]string, error) {
+func (*fakeFS) SetXattr(_ string, _ []protocol.Xattr, _ XattrFilter) error {
+	return nil
+}
+
+// A basic glob-impelementation that should be able to handle
+// simple test cases.
+func (fs *fakeFS) Glob(pattern string) ([]string, error) {
+	dir := filepath.Dir(pattern)
+	file := filepath.Base(pattern)
+	if _, err := fs.Lstat(dir); err != nil {
+		return nil, errPathInvalid
+	}
+
+	var matches []string
+	names, err := fs.DirNames(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, n := range names {
+		matched, err := filepath.Match(file, n)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			matches = append(matches, filepath.Join(dir, n))
+		}
+	}
+	return matches, err
+}
+
+func (*fakeFS) Roots() ([]string, error) {
 	return []string{"/"}, nil
 }
 
-func (fs *fakefs) Usage(name string) (Usage, error) {
+func (*fakeFS) Usage(_ string) (Usage, error) {
 	return Usage{}, errors.New("not implemented")
 }
 
-func (fs *fakefs) Type() FilesystemType {
+func (*fakeFS) Type() FilesystemType {
 	return FilesystemTypeFake
 }
 
-func (fs *fakefs) URI() string {
-	return "fake://" + fs.root.name
+func (fs *fakeFS) URI() string {
+	return fs.uri
 }
 
-func (fs *fakefs) SameFile(fi1, fi2 FileInfo) bool {
-	return fi1.Name() == fi1.Name()
+func (*fakeFS) Options() []Option {
+	return nil
+}
+
+func (fs *fakeFS) SameFile(fi1, fi2 FileInfo) bool {
+	// BUG: real systems base file sameness on path, inodes, etc
+	// we try our best, but FileInfo just doesn't have enough data
+	// so there be false positives, especially on Windows
+	// where ModTime is not that precise
+	var ok bool
+	if fs.insens {
+		ok = UnicodeLowercaseNormalized(fi1.Name()) == UnicodeLowercaseNormalized(fi2.Name())
+	} else {
+		ok = fi1.Name() == fi2.Name()
+	}
+
+	return ok && fi1.ModTime().Equal(fi2.ModTime()) && fi1.Mode() == fi2.Mode() && fi1.IsDir() == fi2.IsDir() && fi1.IsRegular() == fi2.IsRegular() && fi1.IsSymlink() == fi2.IsSymlink() && fi1.Owner() == fi2.Owner() && fi1.Group() == fi2.Group()
+}
+
+func (fs *fakeFS) PlatformData(name string, scanOwnership, scanXattrs bool, xattrFilter XattrFilter) (protocol.PlatformData, error) {
+	return unixPlatformData(fs, name, fs.userCache, fs.groupCache, scanOwnership, scanXattrs, xattrFilter)
+}
+
+func (*fakeFS) underlying() (Filesystem, bool) {
+	return nil, false
+}
+
+func (*fakeFS) wrapperType() filesystemWrapperType {
+	return filesystemWrapperTypeNone
+}
+
+func (fs *fakeFS) resetCounters() {
+	fs.mut.Lock()
+	fs.counters = fakeFSCounters{}
+	fs.mut.Unlock()
+}
+
+func (fs *fakeFS) reportMetricsPerOp(b *testing.B) {
+	fs.reportMetricsPer(b, 1, "op")
+}
+
+func (fs *fakeFS) reportMetricsPer(b *testing.B, divisor float64, unit string) {
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	b.ReportMetric(float64(fs.counters.Lstat)/divisor/float64(b.N), "Lstat/"+unit)
+	b.ReportMetric(float64(fs.counters.DirNames)/divisor/float64(b.N), "DirNames/"+unit)
 }
 
 // fakeFile is the representation of an open file. We don't care if it's
 // opened for reading or writing, it's all good.
 type fakeFile struct {
 	*fakeEntry
-	mut      sync.Mutex
-	rng      io.Reader
-	seed     int64
-	offset   int64
-	seedOffs int64
+	mut           *sync.Mutex
+	rng           io.Reader
+	seed          int64
+	offset        int64
+	seedOffs      int64
+	presentedName string // present (i.e. != "") on insensitive fs only
 }
 
-func (f *fakeFile) Close() error {
+func (*fakeFile) Close() error {
 	return nil
 }
 
@@ -513,12 +800,18 @@ func (f *fakeFile) readShortAt(p []byte, offs int64) (int, error) {
 	// start of the block to serve a given read. 128 KiB blocks fit
 	// reasonably well with the type of IO Syncthing tends to do.
 
-	if f.isdir {
+	if f.entryType == fakeEntryTypeDir {
 		return 0, errors.New("is a directory")
 	}
 
 	if offs >= f.size {
 		return 0, io.EOF
+	}
+
+	if f.content != nil {
+		n := copy(p, f.content[int(offs):])
+		f.offset = offs + int64(n)
+		return n, nil
 	}
 
 	// Lazily calculate our main seed, a simple 64 bit FNV hash our file
@@ -543,7 +836,7 @@ func (f *fakeFile) readShortAt(p []byte, offs int64) (int, error) {
 		diff := offs - minOffs
 		if diff > 0 {
 			lr := io.LimitReader(f.rng, diff)
-			io.Copy(ioutil.Discard, lr)
+			io.Copy(io.Discard, lr)
 		}
 
 		f.offset = offs
@@ -570,7 +863,7 @@ func (f *fakeFile) Seek(offset int64, whence int) (int64, error) {
 	f.mut.Lock()
 	defer f.mut.Unlock()
 
-	if f.isdir {
+	if f.entryType == fakeEntryTypeDir {
 		return 0, errors.New("is a directory")
 	}
 
@@ -596,15 +889,27 @@ func (f *fakeFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *fakeFile) Write(p []byte) (int, error) {
-	return f.WriteAt(p, f.offset)
+	f.mut.Lock()
+	offs := f.offset
+	f.mut.Unlock()
+	return f.WriteAt(p, offs)
 }
 
 func (f *fakeFile) WriteAt(p []byte, off int64) (int, error) {
 	f.mut.Lock()
 	defer f.mut.Unlock()
 
-	if f.isdir {
+	if f.entryType == fakeEntryTypeDir {
 		return 0, errors.New("is a directory")
+	}
+
+	if f.content != nil {
+		if len(f.content) < int(off)+len(p) {
+			newc := make([]byte, int(off)+len(p))
+			copy(newc, f.content)
+			f.content = newc
+		}
+		copy(f.content[int(off):], p)
 	}
 
 	f.rng = nil
@@ -616,6 +921,9 @@ func (f *fakeFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *fakeFile) Name() string {
+	if f.presentedName != "" {
+		return f.presentedName
+	}
 	return f.name
 }
 
@@ -623,6 +931,15 @@ func (f *fakeFile) Truncate(size int64) error {
 	f.mut.Lock()
 	defer f.mut.Unlock()
 
+	if f.content != nil {
+		if int64(cap(f.content)) < size {
+			c := make([]byte, size)
+			copy(c[:len(f.content)], f.content)
+			f.content = c
+		} else {
+			f.content = f.content[:int(size)]
+		}
+	}
 	f.rng = nil
 	f.size = size
 	if f.offset > size {
@@ -632,10 +949,15 @@ func (f *fakeFile) Truncate(size int64) error {
 }
 
 func (f *fakeFile) Stat() (FileInfo, error) {
-	return &fakeFileInfo{*f.fakeEntry}, nil
+	info := &fakeFileInfo{*f.fakeEntry}
+	if f.presentedName != "" {
+		info.name = f.presentedName
+	}
+
+	return info, nil
 }
 
-func (f *fakeFile) Sync() error {
+func (*fakeFile) Sync() error {
 	return nil
 }
 
@@ -661,13 +983,29 @@ func (f *fakeFileInfo) ModTime() time.Time {
 }
 
 func (f *fakeFileInfo) IsDir() bool {
-	return f.isdir
+	return f.entryType == fakeEntryTypeDir
 }
 
 func (f *fakeFileInfo) IsRegular() bool {
-	return !f.isdir
+	return f.entryType == fakeEntryTypeFile
 }
 
 func (f *fakeFileInfo) IsSymlink() bool {
-	return false
+	return f.entryType == fakeEntryTypeSymlink
+}
+
+func (f *fakeFileInfo) Owner() int {
+	return f.uid
+}
+
+func (f *fakeFileInfo) Group() int {
+	return f.gid
+}
+
+func (*fakeFileInfo) Sys() interface{} {
+	return nil
+}
+
+func (*fakeFileInfo) InodeChangeTime() time.Time {
+	return time.Time{}
 }

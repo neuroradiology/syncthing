@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
@@ -12,6 +13,8 @@ import (
 	"log"
 	"testing"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/rc"
 )
 
 func TestReconnectReceiverDuringTransfer(t *testing.T) {
@@ -45,7 +48,7 @@ func testReconnectDuringTransfer(t *testing.T, restartSender, restartReceiver bo
 
 	receiver := startInstance(t, 2)
 	defer func() {
-		// We need a receiver over sender, since we'll update it later to
+		// We need a closure over sender, since we'll update it later to
 		// point at another process.
 		checkedStop(t, receiver)
 	}()
@@ -72,7 +75,7 @@ func testReconnectDuringTransfer(t *testing.T, restartSender, restartReceiver bo
 			t.Fatal(err)
 		}
 
-		if recv.InSyncBytes > 0 && recv.InSyncBytes == recv.GlobalBytes {
+		if recv.InSyncBytes > 0 && recv.InSyncBytes == recv.GlobalBytes && rc.InSync("default", receiver, sender) {
 			// Receiver is done
 			break
 		} else if recv.InSyncBytes > prevBytes+recv.GlobalBytes/10 {
@@ -115,6 +118,10 @@ func testReconnectDuringTransfer(t *testing.T, restartSender, restartReceiver bo
 	log.Println("Comparing directories...")
 	err = compareDirectories("s1", "s2")
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
+	}
+
+	if err := checkRemoteInSync("default", receiver, sender); err != nil {
+		t.Error(err)
 	}
 }

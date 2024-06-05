@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -22,11 +21,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	stdsync "sync"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 )
@@ -40,14 +40,14 @@ type Process struct {
 	addr string
 
 	// Set by eventLoop()
-	eventMut          sync.Mutex
-	id                protocol.DeviceID
-	folders           []string
-	startComplete     bool
-	startCompleteCond *stdsync.Cond
-	stop              bool
-	sequence          map[string]map[string]int64 // Folder ID => Device ID => Sequence
-	done              map[string]bool             // Folder ID => 100%
+	eventMut      sync.Mutex
+	id            protocol.DeviceID
+	folders       []string
+	startComplete chan struct{}
+	stopped       chan struct{}
+	stopErr       error
+	sequence      map[string]map[string]int64 // Folder ID => Device ID => Sequence
+	done          map[string]bool             // Folder ID => 100%
 
 	cmd   *exec.Cmd
 	logfd *os.File
@@ -57,12 +57,13 @@ type Process struct {
 // Example: NewProcess("127.0.0.1:8082")
 func NewProcess(addr string) *Process {
 	p := &Process{
-		addr:     addr,
-		sequence: make(map[string]map[string]int64),
-		done:     make(map[string]bool),
-		eventMut: sync.NewMutex(),
+		addr:          addr,
+		sequence:      make(map[string]map[string]int64),
+		done:          make(map[string]bool),
+		eventMut:      sync.NewMutex(),
+		startComplete: make(chan struct{}),
+		stopped:       make(chan struct{}),
 	}
-	p.startCompleteCond = stdsync.NewCond(p.eventMut)
 	return p
 }
 
@@ -108,19 +109,28 @@ func (p *Process) Start(bin string, args ...string) error {
 
 	p.cmd = cmd
 	go p.eventLoop()
+	go p.wait()
 
 	return nil
+}
+
+func (p *Process) wait() {
+	p.cmd.Wait()
+
+	if p.logfd != nil {
+		p.stopErr = p.checkForProblems(p.logfd)
+	}
+
+	close(p.stopped)
 }
 
 // AwaitStartup waits for the Syncthing process to start and perform initial
 // scans of all folders.
 func (p *Process) AwaitStartup() {
-	p.eventMut.Lock()
-	for !p.startComplete {
-		p.startCompleteCond.Wait()
+	select {
+	case <-p.startComplete:
+	case <-p.stopped:
 	}
-	p.eventMut.Unlock()
-	return
 }
 
 // Stop stops the running Syncthing process. If the process was logging to a
@@ -128,27 +138,26 @@ func (p *Process) AwaitStartup() {
 // panics and data races. The presence of either will be signalled in the form
 // of a returned error.
 func (p *Process) Stop() (*os.ProcessState, error) {
-	p.eventMut.Lock()
-	if p.stop {
-		p.eventMut.Unlock()
-		return p.cmd.ProcessState, nil
+	select {
+	case <-p.stopped:
+		return p.cmd.ProcessState, p.stopErr
+	default:
 	}
-	p.stop = true
-	p.eventMut.Unlock()
 
 	if _, err := p.Post("/rest/system/shutdown", nil); err != nil && err != io.ErrUnexpectedEOF {
 		// Unexpected EOF is somewhat expected here, as we may exit before
 		// returning something sensible.
 		return nil, err
 	}
-	p.cmd.Wait()
 
-	var err error
-	if p.logfd != nil {
-		err = p.checkForProblems(p.logfd)
-	}
+	<-p.stopped
 
-	return p.cmd.ProcessState, err
+	return p.cmd.ProcessState, p.stopErr
+}
+
+// Stopped returns a channel that will be closed when Syncthing has stopped.
+func (p *Process) Stopped() chan struct{} {
+	return p.stopped
 }
 
 // Get performs an HTTP GET and returns the bytes and/or an error. Any non-200
@@ -157,7 +166,7 @@ func (p *Process) Get(path string) ([]byte, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			Dial:              dialer.Dial,
+			DialContext:       dialer.DialContext,
 			Proxy:             http.ProxyFromEnvironment,
 			DisableKeepAlives: true,
 		},
@@ -223,7 +232,7 @@ func (p *Process) Events(since int) ([]Event, error) {
 	dec.UseNumber()
 	err = dec.Decode(&evs)
 	if err != nil {
-		return nil, fmt.Errorf("Events: %s in %q", err, bs)
+		return nil, fmt.Errorf("events: %w in %q", err, bs)
 	}
 	return evs, err
 }
@@ -315,6 +324,7 @@ func InSync(folder string, ps ...*Process) bool {
 		// If our latest FolderSummary didn't report 100%, then we are not done.
 
 		if !ps[i].done[folder] {
+			l.Debugf("done = ps[%d].done[%q] = false", i, folder)
 			return false
 		}
 
@@ -381,14 +391,14 @@ func (p *Process) Model(folder string) (Model, error) {
 	return res, nil
 }
 
-func (p *Process) readResponse(resp *http.Response) ([]byte, error) {
-	bs, err := ioutil.ReadAll(resp.Body)
+func (*Process) readResponse(resp *http.Response) ([]byte, error) {
+	bs, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return bs, err
 	}
 	if resp.StatusCode != 200 {
-		return bs, fmt.Errorf("%s", resp.Status)
+		return bs, errors.New(resp.Status)
 	}
 	return bs, nil
 }
@@ -403,7 +413,10 @@ func (p *Process) checkForProblems(logfd *os.File) error {
 	raceConditionStart := []byte("WARNING: DATA RACE")
 	raceConditionSep := []byte("==================")
 	panicConditionStart := []byte("panic:")
-	panicConditionSep := []byte(p.id.String()[:5])
+	panicConditionSep := []byte("[") // fallback if we don't already know our ID
+	if p.id.String() != "" {
+		panicConditionSep = []byte(p.id.String()[:5])
+	}
 	sc := bufio.NewScanner(fd)
 	race := false
 	_panic := false
@@ -442,14 +455,13 @@ func (p *Process) eventLoop() {
 	notScanned := make(map[string]struct{})
 	start := time.Now()
 	for {
-		p.eventMut.Lock()
-		if p.stop {
-			p.eventMut.Unlock()
+		select {
+		case <-p.stopped:
 			return
+		default:
 		}
-		p.eventMut.Unlock()
 
-		events, err := p.Events(since)
+		evs, err := p.Events(since)
 		if err != nil {
 			if time.Since(start) < 5*time.Second {
 				// The API has probably not started yet, lets give it some time.
@@ -457,18 +469,17 @@ func (p *Process) eventLoop() {
 			}
 
 			// If we're stopping, no need to print the error.
-			p.eventMut.Lock()
-			if p.stop {
-				p.eventMut.Unlock()
+			select {
+			case <-p.stopped:
 				return
+			default:
 			}
-			p.eventMut.Unlock()
 
 			log.Println("eventLoop: events:", err)
 			continue
 		}
 
-		for _, ev := range events {
+		for _, ev := range evs {
 			if ev.ID != since+1 {
 				l.Warnln("Event ID jumped", since, "to", ev.ID)
 			}
@@ -488,7 +499,7 @@ func (p *Process) eventLoop() {
 				p.id = id
 
 				home := data["home"].(string)
-				w, err := config.Load(filepath.Join(home, "config.xml"), protocol.LocalDeviceID)
+				w, _, err := config.Load(filepath.Join(home, "config.xml"), protocol.LocalDeviceID, events.NoopLogger)
 				if err != nil {
 					log.Println("eventLoop: Starting:", err)
 					continue
@@ -511,17 +522,16 @@ func (p *Process) eventLoop() {
 					panic("race, or lost startup event")
 				}
 
-				if !p.startComplete {
+				select {
+				case <-p.startComplete:
+				default:
 					data := ev.Data.(map[string]interface{})
 					to := data["to"].(string)
 					if to == "idle" {
 						folder := data["folder"].(string)
 						delete(notScanned, folder)
 						if len(notScanned) == 0 {
-							p.eventMut.Lock()
-							p.startComplete = true
-							p.startCompleteCond.Broadcast()
-							p.eventMut.Unlock()
+							close(p.startComplete)
 						}
 					}
 				}
@@ -529,18 +539,8 @@ func (p *Process) eventLoop() {
 			case "LocalIndexUpdated":
 				data := ev.Data.(map[string]interface{})
 				folder := data["folder"].(string)
-				version, _ := data["version"].(json.Number).Int64()
 				p.eventMut.Lock()
-				m := p.sequence[folder]
-				if m == nil {
-					m = make(map[string]int64)
-				}
-				device := p.id.String()
-				if device == "" {
-					panic("race, or startup not complete")
-				}
-				m[device] = version
-				p.sequence[folder] = m
+				m := p.updateSequenceLocked(folder, p.id.String(), data["sequence"])
 				p.done[folder] = false
 				l.Debugf("LocalIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
 				p.eventMut.Unlock()
@@ -549,14 +549,8 @@ func (p *Process) eventLoop() {
 				data := ev.Data.(map[string]interface{})
 				device := data["device"].(string)
 				folder := data["folder"].(string)
-				version, _ := data["version"].(json.Number).Int64()
 				p.eventMut.Lock()
-				m := p.sequence[folder]
-				if m == nil {
-					m = make(map[string]int64)
-				}
-				m[device] = version
-				p.sequence[folder] = m
+				m := p.updateSequenceLocked(folder, device, data["sequence"])
 				p.done[folder] = false
 				l.Debugf("RemoteIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
 				p.eventMut.Unlock()
@@ -565,15 +559,36 @@ func (p *Process) eventLoop() {
 				data := ev.Data.(map[string]interface{})
 				folder := data["folder"].(string)
 				summary := data["summary"].(map[string]interface{})
-				need, _ := summary["needBytes"].(json.Number).Int64()
+				need, _ := summary["needTotalItems"].(json.Number).Int64()
 				done := need == 0
 				p.eventMut.Lock()
+				m := p.updateSequenceLocked(folder, p.id.String(), summary["sequence"])
 				p.done[folder] = done
-				l.Debugf("Foldersummary %v %v\n\t%+v", p.id, folder, p.done)
+				l.Debugf("FolderSummary %v %v\n\t%+v\n\t%+v", p.id, folder, p.done, m)
+				p.eventMut.Unlock()
+
+			case "FolderCompletion":
+				data := ev.Data.(map[string]interface{})
+				device := data["device"].(string)
+				folder := data["folder"].(string)
+				p.eventMut.Lock()
+				m := p.updateSequenceLocked(folder, device, data["sequence"])
+				l.Debugf("FolderCompletion %v\n\t%+v", p.id, folder, m)
 				p.eventMut.Unlock()
 			}
 		}
 	}
+}
+
+func (p *Process) updateSequenceLocked(folder, device string, sequenceIntf interface{}) map[string]int64 {
+	sequence, _ := sequenceIntf.(json.Number).Int64()
+	m := p.sequence[folder]
+	if m == nil {
+		m = make(map[string]int64)
+	}
+	m[device] = sequence
+	p.sequence[folder] = m
+	return m
 }
 
 type ConnectionStats struct {
@@ -602,7 +617,6 @@ func (p *Process) Connections() (map[string]ConnectionStats, error) {
 
 type SystemStatus struct {
 	Alloc         int64
-	CPUPercent    float64
 	Goroutines    int
 	MyID          protocol.DeviceID
 	PathSeparator string
@@ -647,4 +661,18 @@ func (p *Process) SystemVersion() (SystemVersion, error) {
 	}
 
 	return res, nil
+}
+
+func (p *Process) RemoteInSync(folder string, dev protocol.DeviceID) (bool, error) {
+	bs, err := p.Get(fmt.Sprintf("/rest/db/completion?folder=%v&device=%v", url.QueryEscape(folder), dev))
+	if err != nil {
+		return false, err
+	}
+
+	var comp model.FolderCompletion
+	if err := json.Unmarshal(bs, &comp); err != nil {
+		return false, err
+	}
+
+	return comp.NeedItems+comp.NeedDeletes == 0, nil
 }

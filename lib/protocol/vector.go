@@ -2,6 +2,8 @@
 
 package protocol
 
+import "time"
+
 // The Vector type represents a version vector. The zero value is a usable
 // version vector. The vector has slice semantics and some operations on it
 // are "append-like" in that they may return the same vector modified, or v
@@ -13,23 +15,32 @@ package protocol
 // one. If it is possible, the vector v is updated and returned. If it is not,
 // a copy will be created, updated and returned.
 func (v Vector) Update(id ShortID) Vector {
+	now := uint64(time.Now().Unix())
+	return v.updateWithNow(id, now)
+}
+
+func (v Vector) updateWithNow(id ShortID, now uint64) Vector {
 	for i := range v.Counters {
 		if v.Counters[i].ID == id {
 			// Update an existing index
-			v.Counters[i].Value++
+			v.Counters[i].Value = max(v.Counters[i].Value+1, now)
 			return v
 		} else if v.Counters[i].ID > id {
 			// Insert a new index
 			nv := make([]Counter, len(v.Counters)+1)
 			copy(nv, v.Counters[:i])
 			nv[i].ID = id
-			nv[i].Value = 1
+			nv[i].Value = max(1, now)
 			copy(nv[i+1:], v.Counters[i:])
-			return Vector{nv}
+			return Vector{Counters: nv}
 		}
 	}
+
 	// Append a new index
-	return Vector{append(v.Counters, Counter{id, 1})}
+	return Vector{Counters: append(v.Counters, Counter{
+		ID:    id,
+		Value: max(1, now),
+	})}
 }
 
 // Merge returns the vector containing the maximum indexes from v and b. If it
@@ -40,7 +51,7 @@ func (v Vector) Merge(b Vector) Vector {
 	for bi < len(b.Counters) {
 		if vi == len(v.Counters) {
 			// We've reach the end of v, all that remains are appends
-			return Vector{append(v.Counters, b.Counters[bi:]...)}
+			return Vector{Counters: append(v.Counters, b.Counters[bi:]...)}
 		}
 
 		if v.Counters[vi].ID > b.Counters[bi].ID {
@@ -71,7 +82,7 @@ func (v Vector) Merge(b Vector) Vector {
 func (v Vector) Copy() Vector {
 	nv := make([]Counter, len(v.Counters))
 	copy(nv, v.Counters)
-	return Vector{nv}
+	return Vector{Counters: nv}
 }
 
 // Equal returns true when the two vectors are equivalent.
@@ -107,6 +118,11 @@ func (v Vector) Counter(id ShortID) uint64 {
 		}
 	}
 	return 0
+}
+
+// IsEmpty returns true when there are no counters.
+func (v Vector) IsEmpty() bool {
+	return len(v.Counters) == 0
 }
 
 // DropOthers removes all counters, keeping only the one with given id. If there

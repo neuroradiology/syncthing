@@ -7,13 +7,43 @@
 package fs
 
 import (
+	"strings"
 	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
-func UnicodeLowercase(s string) string {
-	rs := []rune(s)
-	for i, r := range rs {
-		rs[i] = unicode.ToLower(unicode.ToUpper(r))
+// UnicodeLowercaseNormalized returns the Unicode lower case variant of s,
+// having also normalized it to normalization form C.
+func UnicodeLowercaseNormalized(s string) string {
+	i := firstCaseChange(s)
+	if i == -1 {
+		return norm.NFC.String(s)
 	}
-	return string(rs)
+
+	var rs strings.Builder
+	// WriteRune always reserves utf8.UTFMax bytes for non-ASCII runes,
+	// even if it doesn't need all that space. Overallocate now to prevent
+	// it from ever triggering a reallocation.
+	rs.Grow(utf8.UTFMax - 1 + len(s))
+	rs.WriteString(s[:i])
+
+	for _, r := range s[i:] {
+		rs.WriteRune(unicode.ToLower(unicode.ToUpper(r)))
+	}
+	return norm.NFC.String(rs.String())
+}
+
+// Byte index of the first rune r s.t. lower(upper(r)) != r.
+func firstCaseChange(s string) int {
+	for i, r := range s {
+		if r <= unicode.MaxASCII && (r < 'A' || r > 'Z') {
+			continue
+		}
+		if unicode.ToLower(unicode.ToUpper(r)) != r {
+			return i
+		}
+	}
+	return -1
 }

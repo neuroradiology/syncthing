@@ -9,6 +9,8 @@ package fs
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/syncthing/syncthing/lib/build"
 )
 
 func TestIsInternal(t *testing.T) {
@@ -37,7 +39,7 @@ func TestIsInternal(t *testing.T) {
 	for _, tc := range cases {
 		res := IsInternal(filepath.FromSlash(tc.file))
 		if res != tc.internal {
-			t.Errorf("Unexpected result: IsInteral(%q): %v should be %v", tc.file, res, tc.internal)
+			t.Errorf("Unexpected result: IsInternal(%q): %v should be %v", tc.file, res, tc.internal)
 		}
 	}
 }
@@ -104,5 +106,68 @@ func TestFileModeString(t *testing.T) {
 	exp := "-rwxrwxrwx"
 	if fm.String() != exp {
 		t.Fatalf("Got %v, expected %v", fm.String(), exp)
+	}
+}
+
+func TestIsParent(t *testing.T) {
+	test := func(path, parent string, expected bool) {
+		t.Helper()
+		path = filepath.FromSlash(path)
+		parent = filepath.FromSlash(parent)
+		if res := IsParent(path, parent); res != expected {
+			t.Errorf(`Unexpected result: IsParent("%v", "%v"): %v should be %v`, path, parent, res, expected)
+		}
+	}
+	testBoth := func(path, parent string, expected bool) {
+		t.Helper()
+		test(path, parent, expected)
+		if build.IsWindows {
+			test("C:/"+path, "C:/"+parent, expected)
+		} else {
+			test("/"+path, "/"+parent, expected)
+		}
+	}
+
+	// rel - abs
+	for _, parent := range []string{"/", "/foo", "/foo/bar"} {
+		for _, path := range []string{"", ".", "foo", "foo/bar", "bas", "bas/baz"} {
+			if build.IsWindows {
+				parent = "C:/" + parent
+			}
+			test(parent, path, false)
+			test(path, parent, false)
+		}
+	}
+
+	// equal
+	for i, path := range []string{"/", "/foo", "/foo/bar", "", ".", "foo", "foo/bar"} {
+		if i < 3 && build.IsWindows {
+			path = "C:" + path
+		}
+		test(path, path, false)
+	}
+
+	test("", ".", false)
+	test(".", "", false)
+	for _, parent := range []string{"", "."} {
+		for _, path := range []string{"foo", "foo/bar"} {
+			test(path, parent, true)
+			test(parent, path, false)
+		}
+	}
+	for _, parent := range []string{"foo", "foo/bar"} {
+		for _, path := range []string{"bar", "bar/foo"} {
+			testBoth(path, parent, false)
+			testBoth(parent, path, false)
+		}
+	}
+	for _, parent := range []string{"foo", "foo/bar"} {
+		for _, path := range []string{"foo/bar/baz", "foo/bar/baz/bas"} {
+			testBoth(path, parent, true)
+			testBoth(parent, path, false)
+			if build.IsWindows {
+				test("C:/"+path, "D:/"+parent, false)
+			}
+		}
 	}
 }

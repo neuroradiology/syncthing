@@ -11,6 +11,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -50,7 +51,7 @@ func TestEachFlagBit(t *testing.T) {
 func TestMetaDevices(t *testing.T) {
 	d1 := protocol.DeviceID{1}
 	d2 := protocol.DeviceID{2}
-	meta := newMetadataTracker()
+	meta := newMetadataTracker(nil, events.NoopLogger)
 
 	meta.addFile(d1, protocol.FileInfo{Sequence: 1})
 	meta.addFile(d1, protocol.FileInfo{Sequence: 2, LocalFlags: 1})
@@ -78,5 +79,104 @@ func TestMetaDevices(t *testing.T) {
 	}
 	if devs[1] != d2 {
 		t.Error("second device should be d2")
+	}
+}
+
+func TestMetaSequences(t *testing.T) {
+	d1 := protocol.DeviceID{1}
+	meta := newMetadataTracker(nil, events.NoopLogger)
+
+	meta.addFile(d1, protocol.FileInfo{Sequence: 1})
+	meta.addFile(d1, protocol.FileInfo{Sequence: 2, RawInvalid: true})
+	meta.addFile(d1, protocol.FileInfo{Sequence: 3})
+	meta.addFile(d1, protocol.FileInfo{Sequence: 4, RawInvalid: true})
+	meta.addFile(protocol.LocalDeviceID, protocol.FileInfo{Sequence: 1})
+	meta.addFile(protocol.LocalDeviceID, protocol.FileInfo{Sequence: 2})
+	meta.addFile(protocol.LocalDeviceID, protocol.FileInfo{Sequence: 3, LocalFlags: 1})
+	meta.addFile(protocol.LocalDeviceID, protocol.FileInfo{Sequence: 4, LocalFlags: 2})
+
+	if seq := meta.Sequence(d1); seq != 4 {
+		t.Error("sequence of first device should be 4, not", seq)
+	}
+	if seq := meta.Sequence(protocol.LocalDeviceID); seq != 4 {
+		t.Error("sequence of first device should be 4, not", seq)
+	}
+}
+
+func TestRecalcMeta(t *testing.T) {
+	ldb := newLowlevelMemory(t)
+	defer ldb.Close()
+
+	// Add some files
+	s1 := newFileSet(t, "test", ldb)
+	files := []protocol.FileInfo{
+		{Name: "a", Size: 1000},
+		{Name: "b", Size: 2000},
+	}
+	s1.Update(protocol.LocalDeviceID, files)
+
+	// Verify local/global size
+	snap := snapshot(t, s1)
+	ls := snap.LocalSize()
+	gs := snap.GlobalSize()
+	snap.Release()
+	if ls.Bytes != 3000 {
+		t.Fatalf("Wrong initial local byte count, %d != 3000", ls.Bytes)
+	}
+	if gs.Bytes != 3000 {
+		t.Fatalf("Wrong initial global byte count, %d != 3000", gs.Bytes)
+	}
+
+	// Reach into the database to make the metadata tracker intentionally
+	// wrong and out of date
+	curSeq := s1.meta.Sequence(protocol.LocalDeviceID)
+	tran, err := ldb.newReadWriteTransaction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.meta.mut.Lock()
+	s1.meta.countsPtr(protocol.LocalDeviceID, 0).Sequence = curSeq - 1 // too low
+	s1.meta.countsPtr(protocol.LocalDeviceID, 0).Bytes = 1234          // wrong
+	s1.meta.countsPtr(protocol.GlobalDeviceID, 0).Bytes = 1234         // wrong
+	s1.meta.dirty = true
+	s1.meta.mut.Unlock()
+	if err := s1.meta.toDB(tran, []byte("test")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tran.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that our bad data "took"
+	snap = snapshot(t, s1)
+	ls = snap.LocalSize()
+	gs = snap.GlobalSize()
+	snap.Release()
+	if ls.Bytes != 1234 {
+		t.Fatalf("Wrong changed local byte count, %d != 1234", ls.Bytes)
+	}
+	if gs.Bytes != 1234 {
+		t.Fatalf("Wrong changed global byte count, %d != 1234", gs.Bytes)
+	}
+
+	// Create a new fileset, which will realize the inconsistency and recalculate
+	s2 := newFileSet(t, "test", ldb)
+
+	// Verify local/global size
+	snap = snapshot(t, s2)
+	ls = snap.LocalSize()
+	gs = snap.GlobalSize()
+	snap.Release()
+	if ls.Bytes != 3000 {
+		t.Fatalf("Wrong fixed local byte count, %d != 3000", ls.Bytes)
+	}
+	if gs.Bytes != 3000 {
+		t.Fatalf("Wrong fixed global byte count, %d != 3000", gs.Bytes)
+	}
+}
+
+func TestMetaKeyCollisions(t *testing.T) {
+	if protocol.LocalAllFlags&needFlag != 0 {
+		t.Error("Collision between need flag and protocol local file flags")
 	}
 }

@@ -6,25 +6,11 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/syncthing/syncthing/lib/sync"
 )
-
-func init() {
-	processCollectorOpts := prometheus.ProcessCollectorOpts{
-		Namespace: "syncthing_relaypoolsrv",
-		PidFn: func() (int, error) {
-			return os.Getpid(), nil
-		},
-	}
-
-	prometheus.MustRegister(
-		prometheus.NewProcessCollector(processCollectorOpts),
-	)
-}
 
 var (
 	statusClient = http.Client{
@@ -126,7 +112,7 @@ func refreshStats() {
 		go func(rel *relay) {
 			t0 := time.Now()
 			stats := fetchStats(rel)
-			duration := time.Now().Sub(t0).Seconds()
+			duration := time.Since(t0).Seconds()
 			result := "success"
 			if stats == nil {
 				result = "failed"

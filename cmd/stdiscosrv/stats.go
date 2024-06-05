@@ -7,12 +7,18 @@
 package main
 
 import (
-	"os"
-
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
+	buildInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "syncthing",
+			Subsystem: "discovery",
+			Name:      "build_info",
+			Help:      "A metric with a constant '1' value labeled by version, goversion, builduser and builddate from which stdiscosrv was built.",
+		}, []string{"version", "goversion", "builduser", "builddate"})
+
 	apiRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "syncthing",
@@ -89,6 +95,14 @@ var (
 			Help:       "Latency of database operations.",
 			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		}, []string{"operation"})
+
+	retryAfterHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "syncthing",
+		Subsystem: "discovery",
+		Name:      "retry_after_seconds",
+		Help:      "Retry-After header value in seconds.",
+		Buckets:   prometheus.ExponentialBuckets(60, 2, 7), // 60, 120, 240, 480, 960, 1920, 3840
+	})
 )
 
 const (
@@ -103,21 +117,11 @@ const (
 )
 
 func init() {
-	prometheus.MustRegister(apiRequestsTotal, apiRequestsSeconds,
+	prometheus.MustRegister(buildInfo,
+		apiRequestsTotal, apiRequestsSeconds,
 		lookupRequestsTotal, announceRequestsTotal,
 		replicationSendsTotal, replicationRecvsTotal,
 		databaseKeys, databaseStatisticsSeconds,
-		databaseOperations, databaseOperationSeconds)
-
-	processCollectorOpts := prometheus.ProcessCollectorOpts{
-		Namespace: "syncthing_discovery",
-		PidFn: func() (int, error) {
-			return os.Getpid(), nil
-		},
-	}
-
-	prometheus.MustRegister(
-		prometheus.NewProcessCollector(processCollectorOpts),
-	)
-
+		databaseOperations, databaseOperationSeconds,
+		retryAfterHistogram)
 }

@@ -7,23 +7,25 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 )
 
 const (
@@ -65,34 +67,9 @@ var levelDBOptions = &opt.Options{
 	WriteBuffer: 32 << 20, // default 4<<20
 }
 
-var (
-	Version    string
-	BuildStamp string
-	BuildUser  string
-	BuildHost  string
-
-	BuildDate   time.Time
-	LongVersion string
-)
-
-func init() {
-	stamp, _ := strconv.Atoi(BuildStamp)
-	BuildDate = time.Unix(int64(stamp), 0)
-
-	date := BuildDate.UTC().Format("2006-01-02 15:04:05 MST")
-	LongVersion = fmt.Sprintf(`stdiscosrv %s (%s %s-%s) %s@%s %s`, Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildUser, BuildHost, date)
-}
-
-var (
-	debug = false
-)
+var debug = false
 
 func main() {
-	const (
-		cleanIntv = 1 * time.Hour
-		statsIntv = 5 * time.Minute
-	)
-
 	var listen string
 	var dir string
 	var metricsListen string
@@ -100,43 +77,82 @@ func main() {
 	var replicationPeers string
 	var certFile string
 	var keyFile string
+	var replCertFile string
+	var replKeyFile string
 	var useHTTP bool
+	var largeDB bool
+	var amqpAddress string
+	missesIncrease := 1
 
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
 
 	flag.StringVar(&certFile, "cert", "./cert.pem", "Certificate file")
+	flag.StringVar(&keyFile, "key", "./key.pem", "Key file")
 	flag.StringVar(&dir, "db-dir", "./discovery.db", "Database directory")
 	flag.BoolVar(&debug, "debug", false, "Print debug output")
 	flag.BoolVar(&useHTTP, "http", false, "Listen on HTTP (behind an HTTPS proxy)")
 	flag.StringVar(&listen, "listen", ":8443", "Listen address")
-	flag.StringVar(&keyFile, "key", "./key.pem", "Key file")
 	flag.StringVar(&metricsListen, "metrics-listen", "", "Metrics listen address")
 	flag.StringVar(&replicationPeers, "replicate", "", "Replication peers, id@address, comma separated")
 	flag.StringVar(&replicationListen, "replication-listen", ":19200", "Replication listen address")
+	flag.StringVar(&replCertFile, "replication-cert", "", "Certificate file for replication")
+	flag.StringVar(&replKeyFile, "replication-key", "", "Key file for replication")
+	flag.BoolVar(&largeDB, "large-db", false, "Use larger database settings")
+	flag.StringVar(&amqpAddress, "amqp-address", "", "Address to AMQP broker")
+	flag.IntVar(&missesIncrease, "misses-increase", 1, "How many times to increase the misses counter on each miss")
+	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
 
-	log.Println(LongVersion)
+	log.Println(build.LongVersionFor("stdiscosrv"))
+	if *showVersion {
+		return
+	}
+
+	buildInfo.WithLabelValues(build.Version, runtime.Version(), build.User, build.Date.UTC().Format("2006-01-02T15:04:05Z")).Set(1)
+
+	if largeDB {
+		levelDBOptions.BlockCacheCapacity = 64 << 20
+		levelDBOptions.BlockSize = 64 << 10
+		levelDBOptions.CompactionTableSize = 16 << 20
+		levelDBOptions.CompactionTableSizeMultiplier = 2.0
+		levelDBOptions.WriteBuffer = 64 << 20
+		levelDBOptions.CompactionL0Trigger = 8
+	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
+	if os.IsNotExist(err) {
 		log.Println("Failed to load keypair. Generating one, this might take a while...")
-		cert, err = tlsutil.NewCertificate(certFile, keyFile, "stdiscosrv")
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, "stdiscosrv", 20*365)
 		if err != nil {
 			log.Fatalln("Failed to generate X509 key pair:", err)
 		}
+	} else if err != nil {
+		log.Fatalln("Failed to load keypair:", err)
 	}
-
 	devID := protocol.NewDeviceID(cert.Certificate[0])
 	log.Println("Server device ID is", devID)
+
+	replCert := cert
+	if replCertFile != "" && replKeyFile != "" {
+		replCert, err = tls.LoadX509KeyPair(replCertFile, replKeyFile)
+		if err != nil {
+			log.Fatalln("Failed to load replication keypair:", err)
+		}
+	}
+	replDevID := protocol.NewDeviceID(replCert.Certificate[0])
+	log.Println("Replication device ID is", replDevID)
 
 	// Parse the replication specs, if any.
 	var allowedReplicationPeers []protocol.DeviceID
 	var replicationDestinations []string
 	parts := strings.Split(replicationPeers, ",")
 	for _, part := range parts {
-		fields := strings.Split(part, "@")
+		if part == "" {
+			continue
+		}
 
+		fields := strings.Split(part, "@")
 		switch len(fields) {
 		case 2:
 			// This is an id@address specification. Grab the address for the
@@ -155,6 +171,9 @@ func main() {
 			id, err := protocol.DeviceIDFromString(fields[0])
 			if err != nil {
 				log.Fatalln("Parsing device ID:", err)
+			}
+			if id == protocol.EmptyDeviceID {
+				log.Fatalf("Missing device ID for peer in %q", part)
 			}
 			allowedReplicationPeers = append(allowedReplicationPeers, id)
 
@@ -178,19 +197,35 @@ func main() {
 	// Start any replication senders.
 	var repl replicationMultiplexer
 	for _, dst := range replicationDestinations {
-		rs := newReplicationSender(dst, cert, allowedReplicationPeers)
+		rs := newReplicationSender(dst, replCert, allowedReplicationPeers)
 		main.Add(rs)
 		repl = append(repl, rs)
 	}
 
 	// If we have replication configured, start the replication listener.
 	if len(allowedReplicationPeers) > 0 {
-		rl := newReplicationListener(replicationListen, cert, allowedReplicationPeers, db)
+		rl := newReplicationListener(replicationListen, replCert, allowedReplicationPeers, db)
 		main.Add(rl)
 	}
 
+	// If we have an AMQP broker, start that
+	if amqpAddress != "" {
+		clientID := rand.String(10)
+		kr := newAMQPReplicator(amqpAddress, clientID, db)
+		repl = append(repl, kr)
+		main.Add(kr)
+	}
+
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			for _, r := range repl {
+				r.send("<heartbeat>", nil, time.Now().UnixNano())
+			}
+		}
+	}()
+
 	// Start the main API server.
-	qs := newAPISrv(listen, cert, db, repl, useHTTP)
+	qs := newAPISrv(listen, cert, db, repl, useHTTP, missesIncrease)
 	main.Add(qs)
 
 	// If we have a metrics port configured, start a metrics handler.
@@ -203,5 +238,5 @@ func main() {
 	}
 
 	// Engage!
-	main.Serve()
+	main.Serve(context.Background())
 }

@@ -8,12 +8,12 @@
 */
 
 body {
-    padding-bottom: 70px;
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    overflow-y: scroll;
 }
 
 h1, h2, h3, h4, h5 {
-    font-family: "Raleway", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-family: "Raleway", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     line-height: 1.25;
 }
 
@@ -21,7 +21,7 @@ ul+h5 {
     margin-top: 1.5em;
 }
 
-#content {
+.content {
     margin-bottom: 50px;
 }
 
@@ -39,6 +39,12 @@ ul+h5 {
 
 .checkbox input[type="checkbox"], .radio input[type="radio"] {
     float: none; /* issue #1197 */
+}
+
+#advancedAccordion input.form-control[type="checkbox"] {
+    box-shadow: none;
+    margin: 0;
+    width: auto;
 }
 
 .popover {
@@ -114,7 +120,8 @@ table.table-dynamic {
     word-break: break-all;
 }
 
-table.table-condensed td {
+table.table-condensed td,
+table.table-condensed th {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -122,6 +129,71 @@ table.table-condensed td {
 
 table.table-condensed td.no-overflow-ellipse {
     white-space: normal;
+}
+
+table.table-auto {
+	table-layout: auto;
+}
+
+table.table-auto th {
+	width: 1px;
+}
+
+table.table-auto td {
+    max-width: 0px;
+}
+
+/* Tag name is needed for selector to be specific enough to override Bootstrap style */
+input[type="checkbox"].extended-attributes-filter-rule-checkbox {
+    margin-top: 13px;
+}
+
+/* Remote Devices connection-quality indicator */
+.reception-0 {
+    background: url('../../vendor/bootstrap/fonts/reception-0.svg') no-repeat;
+}
+
+.reception-1 {
+    background: url('../../vendor/bootstrap/fonts/reception-1.svg') no-repeat;
+}
+
+.reception-2 {
+    background: url('../../vendor/bootstrap/fonts/reception-2.svg') no-repeat;
+}
+
+.reception-3 {
+    background: url('../../vendor/bootstrap/fonts/reception-3.svg') no-repeat;
+}
+
+.reception-4 {
+    background: url('../../vendor/bootstrap/fonts/reception-4.svg') no-repeat;
+}
+
+.reception {
+    width: 1em;
+    height: 1em;
+    display: inline-block;
+    vertical-align: -10%;
+    background-size: contain;
+    /* Simulate same width as Fork Awesome icons. */
+    margin-left: .14285715em;
+    margin-right: .14285715em;
+}
+
+.inline-icon {
+    display: inline-block;
+}
+
+/* Wrap long file paths to prevent text overflow. See issue #6268. */
+.word-break-all {
+    word-break: break-all;
+}
+
+/* Break up long words in paragraphs only if necessary to prevent text overflow. */
+.overflow-break-word {
+    overflow-wrap: break-word;
+    /* Legacy name alias */
+    word-wrap: break-word;
 }
 
 .folder-advanced {
@@ -142,16 +214,13 @@ table.table-condensed td.no-overflow-ellipse {
     display: none;
 }
 
-*[language-select] > .dropdown-menu {
+li[language-select] > .dropdown-menu {
+    column-count: 2;
+    column-gap: 0;
     width: 450px;
 }
 
-*[language-select] > .dropdown-menu > li {
-    float: left;
-    width: 50%;
-}
-
-*[language-select] > .dropdown-menu > li > a {
+li[language-select] > .dropdown-menu > li > a {
     overflow: hidden;
     text-overflow: ellipsis;
 }
@@ -224,6 +293,7 @@ identicon {
 .identicon {
     width: 1em;
     height: 1em;
+    shape-rendering: crispEdges;
 }
 
 a.toggler {
@@ -232,6 +302,14 @@ a.toggler {
 a.toggler:hover {
     border-bottom: 1px dashed;
     text-decoration: none;
+}
+
+/**
+ * Panel padding decrease
+ */
+
+.panel-collapse .panel-body {
+    padding: 5px;
 }
 
 /**
@@ -271,23 +349,60 @@ ul.three-columns li, ul.two-columns li {
     z-index: 980;
 }
 
-/** Footer nav on small devices **/
-@media (max-width: 1199px) {
-    /* Stay at the end of the page, with space reserved for the footer
-    usually taking up two rows. */
+/*
+ * Restore Versions tweaks
+ */
 
-    html {
-        position: relative;
-        min-height: 100%;
+#restoreTree-container {
+    overflow-y: scroll;
+    resize: vertical;
+    /* Limit height to prevent vertical screen overflow. */
+    max-height: calc(100vh - 390px);
+    /* Always fit at least one folder with dropdown open. */
+    min-height: 136px;
+}
+@media (min-width: 768px) {
+    #restoreTree-container {
+        max-height: calc(100vh - 401px);
     }
+}
+@media (min-width: 992px) {
+    #restoreTree-container {
+        max-height: calc(100vh - 333px);
+    }
+}
 
-    body {
-        padding-bottom: 60px;
-    }
+/* Ignore fixed height when manually resized. */
+#restoreTree-container[style*="height"] {
+    max-height: none;
+}
 
-    .navbar-fixed-bottom {
-        position: absolute;
-    }
+/* Remove table outline as rows have own focus style already. */
+#restoreTree:focus {
+    outline: 0;
+}
+
+/* Align dropdown with title first line. */
+#restoreTree td + td {
+    padding-top: 4px;
+    vertical-align: top;
+}
+
+/* Reduce space between toggle and menu on mobile. */
+#restoreTree .dropdown-toggle {
+    margin-bottom: 0;
+}
+
+/* Change direction to remain on screen on mobile. */
+#restoreTree .dropdown-menu {
+    left: auto;
+    right: 0;
+}
+
+/* Ensure maximum space for filtering and date range. */
+#restoreVersions .form-group,
+#restoreVersions .form-control {
+    width: 100%;
 }
 
 @media (max-width: 768px) {
@@ -302,10 +417,6 @@ ul.three-columns li, ul.two-columns li {
         margin: 3.25px -15px;
     }
 
-    .navbar-fixed-bottom {
-        position: relative;
-    }
-
     .navbar-nav .open .dropdown-menu {
         position: absolute;
         left: auto;
@@ -318,23 +429,25 @@ ul.three-columns li, ul.two-columns li {
         border-radius: 2px;
     }
 
-    *[language-select] {
+    li[language-select] {
         position: static !important;
     }
 
-    *[language-select] > .dropdown-menu {
+    li[language-select] > .dropdown-menu {
+        column-count: auto;
         margin-left: 15px;
         margin-right: 15px;
         margin-top: -12px !important;
         max-width: 450px;
-        height: 265px;
         overflow-y: scroll;
+        /* height of 5.5 elements + negative margin-top */
+        height: 276px;
     }
 
-    table.table-condensed td {
-        /* for mobile phones to allow linebreaks in long repro folder/shared with
-        * columns. */
-        white-space: normal;
+    .two-columns {
+        -webkit-column-count: 1;
+        -moz-column-count: 1;
+        column-count: 1;
     }
 }
 
@@ -347,16 +460,103 @@ ul.three-columns li, ul.two-columns li {
     .navbar-nav .open .dropdown-menu > li > a {
         padding: 12px 15px 12px 25px;
     }
-
-    .navbar-fixed-bottom li {
-         width: 100%;
-    }
 }
 
 .tab-content {
     padding-top: 10px;
 }
 
-.fancytree-ext-table {
-    width: 100% !important;
+@media (max-width: 419px) {
+    /* The selectors are build to target only the content of folder and device
+       panels as it would "destroy" e.g. out of sync or recent changes listings.
+       The !important is needed to override .visible-xs that sets display to a
+       specific table element instead of block. */
+    div[id^='device-'].panel-collapse table,
+    div[id^='folder-'].panel-collapse table,
+    div[id^='device-'].panel-collapse tbody,
+    div[id^='folder-'].panel-collapse tbody,
+    div[id^='device-'].panel-collapse tr,
+    div[id^='folder-'].panel-collapse tr {
+        display: block !important;
+    }
+    div[id^='device-'].panel-collapse th,
+    div[id^='folder-'].panel-collapse th,
+    div[id^='device-'].panel-collapse td,
+    div[id^='folder-'].panel-collapse td {
+        display: block;
+        max-width: 100%;
+        width: 100%;
+    }
+
+    /* All buttons, except panel headings, get bottom margin, as they
+       won't fit beside each other anymore. Reduce footer padding to
+       compensate for the margin. */
+    .btn:not(.panel-heading),
+    .btn:not(.panel-heading) + .btn:not(.panel-heading) {
+        margin-bottom: 10px;
+    }
+    .panel-footer {
+        padding-bottom: 0;
+    }
+    .modal-footer {
+        padding-bottom: 5px;
+    }
+
+    table.table-auto td,
+    table.table-auto th,
+    table.table-condensed td,
+    table.table-condensed th {
+        /* for mobile phones to allow linebreaks in long repro folder/shared with
+        * columns. */
+        white-space: normal;
+    }
+
+    /* Move share buttons below device ID on small screens. */
+    #shareDeviceIdButtons {
+        display: inline-block;
+    }
+}
+
+.form-horizontal .form-group {
+    margin-bottom: 5px;
+}
+
+.form-horizontal {
+    margin-bottom: 10px;
+}
+
+/* Use the same style as Bootstrap uses for disabled <select>. */
+.form-control option[disabled] {
+    background-color: #eeeeee;
+    opacity: 1;
+}
+
+.checkbox[disabled] {
+    background-color: #eeeeee;
+    opacity: 1;
+    margin-left: -5px;
+    padding-left: 5px;
+}
+
+.checkbox[disabled] *, .checkbox[disabled] .help-block {
+    color: #999999;
+    cursor: not-allowed;
+}
+
+/* Make a "well" look more like a readonly text input when grouped with a button */
+.input-group .well-sm {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+/* CJK languages don't use italic at all, hence don't force it on them. */
+html[lang|="zh"] i,
+html[lang="ja"] i,
+html[lang|="ko"] i {
+    font-style: normal;
+}
+
+.select-on-click {
+    -webkit-user-select: all;
+    user-select: all;
 }
